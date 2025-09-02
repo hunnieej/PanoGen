@@ -223,14 +223,6 @@ class SphereDiffusion(nn.Module):
         return prompt_embeds, pooled_prompt_embeds, add_time_ids
 
     @torch.no_grad()
-    def _masked_mean(self, h, attn_mask):
-        # h: [B, L, C], attn_mask: [B, L] (1 for valid)
-        w = attn_mask.to(h.dtype).unsqueeze(-1)           # [B,L,1]
-        s = (h * w).sum(dim=1)                            # [B,C]
-        z = w.sum(dim=1).clamp_min(1e-6)                  # [B,1]
-        return s / z
-
-    @torch.no_grad()
     def get_text_embeds_sd35(self, prompt, negative_prompt="", max_sequence_length=77):
         # TODO : 구현해야함
         return 
