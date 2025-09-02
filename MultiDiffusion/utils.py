@@ -5,60 +5,6 @@ import math
 import os
 from PIL import Image, ImageDraw
 
-def build_2d_sincos_pe(Hp, Wp, D, device, dtype, temperature=10000.0):
-    assert D % 2 == 0, "pos dim D must be even"
-    d_half = D // 2
-    assert d_half % 2 == 0, "D/2 must be even"
-
-    def get_1d_sincos(L, dim):
-        pos = torch.arange(L, device=device, dtype=dtype).unsqueeze(1)     # [L,1]
-        i = torch.arange(0, dim, 2, device=device, dtype=dtype)            # [dim/2]
-        inv = 1.0 / (temperature ** (i / dim))
-        ang = pos * inv                                                    # [L,dim/2]
-        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)           # [L,dim]
-        return emb
-
-    y = get_1d_sincos(Hp, d_half)      # [Hp, D/2]
-    x = get_1d_sincos(Wp, d_half)      # [Wp, D/2]
-    pe = torch.zeros(Hp, Wp, D, device=device, dtype=dtype)
-    pe[..., :d_half] = y[:, None, :]
-    pe[..., d_half:] = x[None, :, :]
-    return pe.reshape(1, Hp*Wp, D)
-
-def build_spherical_sincos_pe(lon: torch.Tensor,
-                              lat: torch.Tensor,
-                              D: int,
-                              device=None,
-                              dtype=torch.float32,
-                              temperature: float = 10000.0):
-    """
-    lon: [Hp, Wp] 경도 (radians, [-pi, pi])
-    lat: [Hp, Wp] 위도 (radians, [-pi/2, pi/2])
-    D: 임베딩 차원 (짝수)
-    """
-    assert D % 2 == 0, "pos dim D must be even"
-    d_half = D // 2
-    assert d_half % 2 == 0, "D/2 must be even"
-
-    def encode_angle(angle: torch.Tensor, dim: int):
-        """
-        angle: [Hp, Wp]
-        dim: 몇 차원으로 펼칠지
-        """
-        pos = angle.unsqueeze(-1)                          # [Hp, Wp, 1]
-        i = torch.arange(0, dim, 2, device=device, dtype=dtype)  # [dim/2]
-        inv = 1.0 / (temperature ** (i / dim))
-        ang = pos * inv                                    # [Hp, Wp, dim/2]
-        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [Hp, Wp, dim]
-        return emb
-
-    # 위도/경도 각각 D/2 차원
-    emb_lat = encode_angle(lat.to(device=device, dtype=dtype), d_half)  # [Hp,Wp,D/2]
-    emb_lon = encode_angle(lon.to(device=device, dtype=dtype), d_half)  # [Hp,Wp,D/2]
-
-    pe = torch.cat([emb_lat, emb_lon], dim=-1)  # [Hp, Wp, D]
-    return pe.reshape(1, -1, D)                 # [1, Hp*Wp, D]
-
 def get_vae_spatial_factor(vae, default=8):
     try:
         conf = getattr(vae, "config", None)

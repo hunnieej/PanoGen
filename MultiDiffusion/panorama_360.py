@@ -21,17 +21,14 @@ from diffusers import (AutoencoderKL,
 # utils : 그 외 다른 함수들 넣기
 from projection import (generate_fibonacci_lattice, 
                    spherical_to_perspective_tiles, 
-                   compute_patch_directions,
                    perspective_to_spherical_latent,
                    stitch_final_erp_from_tiles,
-                   stitch_final_erp_from_tiles_xl
+                   stitch_final_erp_from_tiles_xl,
                    )
 
-from utils import (build_2d_sincos_pe,
-                   build_spherical_sincos_pe,
-                    make_timestep_1d,
-                    save_tiles_on_panorama
-                    )
+from utils import (make_timestep_1d,
+                   save_tiles_on_panorama
+                   )
 
 # suppress partial model loading warning
 logging.set_verbosity_error()
@@ -48,6 +45,41 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = True
+
+def _add_position_to_hidden_states(hidden_states, tile_info):
+    """
+    hidden_states에 직접 position embedding 추가
+    """
+    B, C, H, W = hidden_states.shape
+    
+    # Position embedding 생성
+    lin_coords = tile_info["lin_coords"].long()
+    y_coords = (lin_coords // W).float()
+    x_coords = (lin_coords % W).float()
+    
+    # Normalize coordinates to [-1, 1]
+    y_normalized = (y_coords / (H-1)) * 2 - 1
+    x_normalized = (x_coords / (W-1)) * 2 - 1
+    
+    # Sinusoidal position encoding
+    def pos_encoding(pos, dim):
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=pos.device, dtype=pos.dtype) / dim))
+        sin_inp = torch.outer(pos, inv_freq)
+        pos_emb = torch.cat([sin_inp.sin(), sin_inp.cos()], dim=-1)
+        return pos_emb
+    
+    # Position embeddings
+    pos_dim = C // 2  # Use half channels for position
+    y_emb = pos_encoding(y_normalized, pos_dim)  # [H*W, pos_dim]
+    x_emb = pos_encoding(x_normalized, pos_dim)  # [H*W, pos_dim]
+    
+    # Combine position embeddings
+    pos_emb = torch.cat([y_emb, x_emb], dim=-1)  # [H*W, C]
+    pos_emb = pos_emb.view(H, W, C).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+    pos_emb = pos_emb.expand(B, -1, -1, -1)  # [B, C, H, W]
+    
+    # Add to hidden states
+    return hidden_states + pos_emb
 
 ########################################################################################################
 # TODO : SANA, SDXL, SD v3.5 구현 
@@ -341,15 +373,6 @@ class SphereDiffusion(nn.Module):
 
         text_cond = _prepare_text_cond()
 
-        # ----- pos-embed meta (DiT-like) -----
-        if self.rf_version in ['SANA','3.5']:
-            patch = getattr(self.unet, "patch_size", 2)
-            Dm = getattr(self.unet, "inner_dim",
-                getattr(self.unet, "hidden_size",
-                getattr(getattr(self.unet, "config", object()), "inner_dim", 1024)))
-        else:
-            patch, Dm = None, None
-
         # ===== helpers =====
         def _make_cond_kwargs(batch_size):
             if text_cond['kind'] == 'sana':
@@ -367,11 +390,15 @@ class SphereDiffusion(nn.Module):
             else:
                 return dict(encoder_hidden_states=text_cond['embeds'])
 
-        def _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs):
+        def _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs, tile_info=None):
             if self.rf_version =='SANA':
                 lin = self.scheduler.scale_model_input(latent_in, t_scalar)
                 t_in = make_timestep_1d(t_scalar, latent_in.shape[0], self.device, float_for_dit=True)
-                out = self.unet(hidden_states=lin, timestep=t_in, **cond_kwargs, return_dict=True).sample
+                if tile_info is not None:
+                    print("Use tile info")
+                    lin = _add_position_to_hidden_states(lin, tile_info)
+                out = self.unet(hidden_states=lin, timestep=t_in, 
+                            **cond_kwargs, return_dict=True).sample
             elif self.rf_version == '3.5':
                 lin = self.scheduler.scale_model_input(latent_in, t_scalar)
                 t_in = make_timestep_1d(t_scalar, latent_in.shape[0], self.device, float_for_dit=True)
@@ -454,7 +481,7 @@ class SphereDiffusion(nn.Module):
         print(f"[INFO] Output folder ready: {outfolder}")
         if save_intermediate:
             print(f"[INFO] Will save {len(tiles)} tiles × {num_inference_steps} steps = {len(tiles)*num_inference_steps} tile images")
-
+        
         with tqdm(total=total_steps, desc='Generating panorama') as pbar:
             for step_idx, t_scalar in enumerate(self.scheduler.timesteps):
                 tile_eps_list = []

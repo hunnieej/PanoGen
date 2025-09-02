@@ -1,6 +1,9 @@
 import torch
 import numpy as np
 import math
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
 
 from utils import get_vae_spatial_factor
 
@@ -241,140 +244,6 @@ def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=80.0, overl
         })
     return tiles
 
-####################################################################################################################
-# ------------------------------------------------------------------------
-# NOTE : Dynamic Latent Sampling ver.2
-# 1) a queue, 2) FoV adjustment, and 3) center-first selection
-# ------------------------------------------------------------------------
-'''
-def make_spiral_order(H: int, W: int):
-    assert H == W and H % 2 == 0
-    order = []
-    for i in range(1, H // 2 + 1):
-        top, left  = H//2 - i, H//2 - i
-        bot, right = H//2 + i - 1, H//2 + i - 1
-        for c in range(left, right + 1):                order.append((top, c))
-        for r in range(top + 1, bot):                   order.append((r, right))
-        for c in range(right, left - 1, -1):            order.append((bot, c))
-        for r in range(bot - 1, top, -1):               order.append((r, left))
-    return torch.tensor(order, dtype=torch.long)        # [H*W, 2]
-
-@torch.no_grad()
-def dynamic_latent_sampling_to_grid(
-    uv: torch.Tensor,         # [M_vis, 2] 픽셀좌표 (u,v)
-    K: torch.Tensor,          # [3,3] intrinsics
-    Ht: int, Wt: int,         # 타겟 "latent" 격자 크기 (UNet conv 입력 기준)
-    *, mode: str = "pixel",   # "pixel" | "token"
-    patch: int = 2            # mode="token"일 때 패치 사이즈 p
-):
-    """
-    모든 모델 공통:
-      - mode="pixel":   타겟 = Ht×Wt (UNet conv)
-      - mode="token":   타겟 = Hp×Wp with Hp=Ht//patch, Wp=Wt//patch (DiT류)
-    반환:
-      Htar, Wtar, pick, lin_coords, rc_coords
-      (pick: 선택된 uv 인덱스, lin_coords: [0..Htar*Wtar-1], rc_coords: [N,2])
-    """
-    device, dtype = uv.device, uv.dtype
-    fx, fy = K[0,0], K[1,1]; cx, cy = K[0,2], K[1,2]
-    # 중심-우선 정렬: 정규화 평면 거리
-    u_n = (uv[:, 0] - cx) / fx
-    v_n = (uv[:, 1] - cy) / fy
-    r2  = u_n**2 + v_n**2
-    order = torch.argsort(r2)     # center-first
-
-    if mode == "token":
-        assert (Ht % patch == 0) and (Wt % patch == 0)
-        Htar, Wtar = Ht // patch, Wt // patch
-    else:
-        Htar, Wtar = Ht, Wt
-    assert (Htar == Wtar) and (Htar % 2 == 0), "타겟 격자는 짝수 정사각 권장"
-
-    grid_rc = make_spiral_order(Htar, Wtar).to(device)  # [Htar*Wtar,2] 중심→바깥
-    Ntar = grid_rc.shape[0]
-    Ksel = min(uv.shape[0], Ntar)
-    pick = order[:Ksel]                                # 중심에서 가까운 것부터 채우기
-    rc   = grid_rc[:Ksel]
-    lin_coords = rc[:,0] * Wtar + rc[:,1]
-    return Htar, Wtar, pick, lin_coords, rc
-
-@torch.no_grad()
-def project_dynamic_sampling_general(
-    dirs: torch.Tensor, R: torch.Tensor, K: torch.Tensor,
-    Ht: int, Wt: int,
-    *, target_mode: str = "pixel", patch: int = 2
-):
-    """
-    1) 구면 dirs -> 카메라 좌표 -> 투영 uv
-    2) 가시성(z>0) 필터
-    3) Dynamic Latent Sampling으로 Ht×Wt (또는 Hp×Wp)로 다운샘플
-    """
-    X = dirs @ R.T
-    vis = X[:, 2] > 0
-    vis_idx = torch.nonzero(vis, as_tuple=False).squeeze(1)
-    Xv = X[vis]
-    homog = (K @ Xv.T).T
-    uv = torch.stack([homog[:, 0] / homog[:, 2], homog[:, 1] / homog[:, 2]], dim=-1)  # [M,2]
-
-    Htar, Wtar, pick_in_vis, lin_coords, rc_coords = dynamic_latent_sampling_to_grid(
-        uv, K, Ht, Wt, mode=target_mode, patch=patch
-    )
-    used_idx = vis_idx[pick_in_vis]
-    uv_sel = uv[pick_in_vis]
-    return Htar, Wtar, used_idx, lin_coords, rc_coords, uv_sel
-
-def spherical_to_perspective_tiles(
-    dirs: torch.Tensor,
-    H: int, W: int,                 # 타일 타깃 격자 크기 (모델별로 조절)
-    fov_deg: float = 80.0,
-    overlap: float = 0.6,
-    *,
-    target_mode: str = "pixel",     # "pixel" (UNet conv) | "token" (DiT류; Hp×Wp 선택)
-    patch: int = 2                  # target_mode="token"일 때 패치 크기
-):
-    """
-    - 센터는 89개 고정 (SphereDiff 배치)
-    - 각 타일의 intrinsics K는 (H,W,fov_deg)로 동일
-    - 각 타일마다 Dynamic Latent Sampling으로 spherical dirs -> 타깃 격자에 매핑
-    """
-    device, dtype = dirs.device, dirs.dtype
-    K = make_intrinsic(H, W, fov_deg, device=device, dtype=dtype)
-
-    # 센터(89) 고정
-    yaws, pitches = make_view_centers_89()
-
-    tiles = []
-    for yaw_deg, pitch_deg in zip(yaws, pitches):
-        yaw = math.radians(yaw_deg)
-        pitch = math.radians(pitch_deg)
-
-        # (+Z 전방 컨벤션; 네 코드 컨벤션과 일치시켜 사용)
-        look_dir = torch.tensor([
-            math.cos(pitch) * math.sin(yaw),
-            math.sin(pitch),
-            math.cos(pitch) * math.cos(yaw)
-        ], device=device, dtype=dtype)
-
-        R = make_extrinsic(look_dir)  # world->cam
-
-        # --- Dynamic Latent Sampling (가시성 -> uv -> 중심우선 스파이럴 배치) ---
-        Ht, Wt, used_idx, lin_coords, rc_coords, uv_sel = project_dynamic_sampling_general(
-            dirs=dirs, R=R, K=K, Ht=H, Wt=W,
-            target_mode=target_mode, patch=patch
-        )
-
-        tiles.append({
-            "yaw": yaw_deg, "pitch": pitch_deg,
-            "R": R, "K": K,
-            "H": Ht, "W": Wt,                 # 보통 Ht=H, Wt=W (타깃 고정)
-            "used_idx": used_idx,             # [Ht*Wt] 또는 [Hp*Wp] (token 모드)
-            "lin_coords": lin_coords,         # [Ht*Wt] 또는 [Hp*Wp]
-            "rc_coords": rc_coords,           # [N,2] (디버그/시각화용)
-            "uv_sel": uv_sel                   # [N,2] (디버그/시각화용)
-        })
-
-    return tiles
-'''
 ##########################################################################################################################
 # ------------------------------------------------------------------------
 # F^-1 : I -> S
@@ -422,6 +291,8 @@ def perspective_to_spherical_latent(
         torch.zeros_like(accum),
     )
     return spherical_feats  # [N_dirs, C]
+
+##########################################################################################################################
 
 ##########################################################################################################################
 # NOTE : ERP Splatting
@@ -520,43 +391,6 @@ def splat_tile_to_erp(
         wsum.view(-1).index_add_(0, idx, w_full.squeeze(0).reshape(-1))
 
     return accum_img, wsum
-
-def compute_patch_directions(Ht, Wt, patch, K, R_wc, device=None, dtype=torch.float32):
-    """
-    각 패치 중심의 월드 좌표계 방향벡터 d_world를 계산.
-    
-    Args:
-        Ht, Wt : 타일 해상도 (픽셀)
-        patch  : patch size (ex. 2)
-        K      : [3,3] intrinsic
-        R_wc   : [3,3] cam->world 회전행렬
-    Returns:
-        d_world: [Hp,Wp,3] (Hp=Ht/patch, Wp=Wt/patch)
-    """
-    device = device or K.device
-
-    Hp, Wp = Ht // patch, Wt // patch
-    yy, xx = torch.meshgrid(
-        torch.arange(0, Ht, patch, device=device, dtype=dtype) + patch/2,
-        torch.arange(0, Wt, patch, device=device, dtype=dtype) + patch/2,
-        indexing="ij"
-    )  # [Hp,Wp]
-
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
-
-    # 카메라 좌표계 방향
-    x = (xx - cx) / fx
-    y = (yy - cy) / fy   # (부호는 overlay/dots와 일관성 유지!)
-    z = torch.ones_like(x)
-    d_cam = torch.stack([x,y,z], dim=-1)
-    d_cam = torch.nn.functional.normalize(d_cam, dim=-1)
-
-    # 월드 좌표계 방향
-    d_world = torch.einsum('hwc,cd->hwd', d_cam, R_wc.to(dtype))
-    return d_world
-
-
 
 def stitch_final_erp_from_tiles(
     feats_spherical: torch.Tensor,   # [N_dirs, C]
