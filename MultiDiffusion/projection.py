@@ -392,9 +392,9 @@ def splat_tile_to_erp(
 
     return accum_img, wsum
 
+@torch.no_grad()
 def stitch_final_erp_from_tiles(
     feats_spherical: torch.Tensor,   # [N_dirs, C]
-    dirs: torch.Tensor,              # [N_dirs, 3]
     tiles: list,                     # dict: 'H','W','K','R','lin_coords','used_idx'
     vae, scale: float,               # <- 외부 scale 무시하고 VAE의 scaling_factor 사용 권장
     pano_H: int, pano_W: int, fov_deg: float,
@@ -403,22 +403,14 @@ def stitch_final_erp_from_tiles(
     device = feats_spherical.device
     s = get_vae_spatial_factor(vae)
 
-    # ---------- VAE 준비: fp32 + AMP 비활성화로 디코딩 ----------
-    # (한 번만 수행; 루프 안에서 dtype 전환하지 않음)
     vae.eval()
     vae.requires_grad_(False)
-    # SDXL VAE는 fp16에서 색 드리프트가 잦으므로 fp32로 고정
     vae = vae.to(dtype=torch.float32, device=device)
     vae_scale = float(getattr(vae.config, "scaling_factor", 0.13025))
     # VAE 입력 파이프의 dtype
     if rf_version.startswith('SANA'):
         # SANA VAE는 fp16 파라미터
         vae_in_dtype = torch.bfloat16
-    elif rf_version.startswith('3.5'):
-        vae_in_dtype = torch.bfloat16
-    elif rf_version.startswith('SDXL'):
-        
-        vae_in_dtype = torch.float32
     else:
         try:
             vae_in_dtype = next(vae.post_quant_conv.parameters()).dtype
@@ -472,6 +464,75 @@ def stitch_final_erp_from_tiles(
     wsum[wsum == 0] = 1.0
     erp = (accum / wsum).clamp(0, 1)  # [3,H,W]
     return erp
+
+@torch.no_grad()
+def stitch_final_erp_from_tiles_35(
+    feats_spherical: torch.Tensor,   # [N_dirs, C]
+    tiles: list,                     # dict: 'H','W','K','R','lin_coords','used_idx'
+    vae,                             # AutoencoderKL
+    pano_H: int, pano_W: int, fov_deg: float,
+):
+    device = feats_spherical.device
+    s = get_vae_spatial_factor(vae)
+
+    vae.eval().requires_grad_(False).to(device=device)
+
+    # --- SD3.5 VAE 스케일/시프트 ---
+    sf = float(getattr(vae.config, "scaling_factor", 1.5305))
+    sh = float(getattr(vae.config, "shift_factor",   0.0609))
+
+    # --- dtype 정책 결정 ---
+    force_upcast = bool(getattr(vae.config, "force_upcast", False))
+    if force_upcast:
+        vae = vae.to(dtype=torch.float32)
+        vae_in_dtype = torch.float32
+        use_autocast = False           # fp32 디코딩
+    else:
+        # VAE가 bf16로 로드됐다면 그대로 유지
+        vae_in_dtype = getattr(vae, "dtype", torch.bfloat16)
+        # bf16/half면 autocast 사용 가능, fp32면 끔
+        use_autocast = (vae_in_dtype in (torch.bfloat16, torch.float16))
+
+    accum = torch.zeros(3, pano_H, pano_W, device=device, dtype=torch.float32)
+    wsum  = torch.zeros(1, pano_H, pano_W, device=device, dtype=torch.float32)
+
+    for tile in tiles:
+        Ht, Wt = tile['H'], tile['W']
+        K_lat  = tile['K']
+        K_px   = scale_intrinsics_to_pixels(K_lat, s).to(torch.float32)
+        R_wc   = tile['R'].to(torch.float32)
+
+        # ---- 타일 latent 만들기: [C,Ht,Wt] ----
+        flat = torch.zeros(Ht*Wt, feats_spherical.shape[1], device=device, dtype=feats_spherical.dtype)
+        flat.index_copy_(0, tile['lin_coords'].long(), feats_spherical[tile['used_idx'].long()])
+        L_chw = flat.view(Ht, Wt, -1).permute(2,0,1).contiguous()  # [C,Ht,Wt]
+
+        # ---- 디코드 입력 준비: 항상 fp32에서 scale/shift 계산 -> 최종 dtype으로 캐스팅 ----
+        tile_latent = L_chw.unsqueeze(0).to(torch.float32)         # [1,C,Ht,Wt], calc in fp32
+        tile_latent = (tile_latent / sf) + sh
+        tile_latent = tile_latent.to(device=vae.device, dtype=vae_in_dtype)
+
+        # ---- 디코드: fp32면 autocast OFF, bf16/half면 해당 dtype으로 ON ----
+        if use_autocast and vae_in_dtype != torch.float32:
+            with torch.cuda.amp.autocast(enabled=True, dtype=vae_in_dtype):
+                img_tile = vae.decode(tile_latent).sample[0].to(torch.float32)  # [-1,1] -> fp32로 모음
+        else:
+            # fp32 경로(권장 for SD3.5 force_upcast)
+            img_tile = vae.decode(tile_latent).sample[0].to(torch.float32)
+
+        img01 = (img_tile / 2 + 0.5).clamp(0, 1)  # [-1,1] -> [0,1]
+
+        # ---- ERP 누적 ----
+        accum, wsum = splat_tile_to_erp(
+            img01, R_wc, K_px, pano_H, pano_W, fov_deg,
+            beta=2.0, use_coslat=True,
+            accum_img=accum, wsum=wsum
+        )
+
+    wsum[wsum == 0] = 1.0
+    erp = (accum / wsum).clamp(0, 1)  # [3,H,W]
+    return erp
+
 
 @torch.no_grad()
 def stitch_final_erp_from_tiles_xl(
