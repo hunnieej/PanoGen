@@ -211,6 +211,7 @@ def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tenso
 # F : S -> I
 # ----------------------------------------------------------------------
 def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=80.0, overlap=0.6):
+    # TODO : Tile size에 관계없이 구면에서 FoV를 반영해야함 + overlap 도 반영해야함.
     K = make_intrinsic(H, W, fov_deg, device=dirs.device, dtype=dirs.dtype)
     # yaws, pitches = make_view_centers(fov_deg, overlap)
     yaws, pitches = make_view_centers_89()

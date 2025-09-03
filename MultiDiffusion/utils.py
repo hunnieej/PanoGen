@@ -88,6 +88,8 @@ def _draw_polyline_wrapped(draw: ImageDraw.ImageDraw, uvs: torch.Tensor, pano_W:
     uvs: [L,2] (float)
     """
     if uvs.shape[0] < 2: return
+    if uvs.dtype == torch.bfloat16:
+        uvs = uvs.to(torch.float32)
     us = uvs[:,0].cpu().numpy()
     vs = uvs[:,1].cpu().numpy()
     path = [(float(us[0]), float(vs[0]))]
@@ -145,6 +147,8 @@ def save_tiles_on_panorama(
                 v_n = (torch.tensor([Ht / 2.0], device=tile["K"].device) - cy) / fy
                 d_cam = torch.stack([u_n, v_n, torch.ones_like(u_n)], dim=-1)  # [1,3]
                 d_cam = d_cam / torch.linalg.norm(d_cam, dim=-1, keepdim=True)
+                if tile["R"].dtype == torch.bfloat16:
+                    tile["R"] = tile["R"].to(torch.float32)
                 d_world = d_cam @ tile["R"].transpose(0, 1)
                 uv_ctr = dirs_to_equirect_uv(d_world, pano_H, pano_W, top_is_north=True)[0]
                 u0 = int(uv_ctr[0].clamp(0, pano_W - 1).item())

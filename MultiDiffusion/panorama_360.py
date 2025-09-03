@@ -16,7 +16,7 @@ from diffusers import (AutoencoderKL,
                        SanaTransformer2DModel,
                        SD3Transformer2DModel,
                        AutoencoderDC)
-# TODO : 함수 정리
+
 # functions : Sphere - S^2 - ERP 관련 함수 넣기
 # utils : 그 외 다른 함수들 넣기
 from projection import (generate_fibonacci_lattice, 
@@ -212,7 +212,7 @@ class SphereDiffusion(nn.Module):
         self,
         prompt,
         negative_prompt="",
-        max_sequence_length=512,  # T5 최대 길이를 512로 증가
+        max_sequence_length=512,
         clip_skip=None,
         device=None,
         dtype=None
@@ -432,7 +432,7 @@ class SphereDiffusion(nn.Module):
         # ----- spherical directions & global latent -----
         dirs = generate_fibonacci_lattice(N_dirs).to(self.device, self.unet.dtype)  # [N,3]
         C = self.unet.config.in_channels if hasattr(self.unet, "config") else self.unet.in_channels
-        feats = torch.randn(N_dirs, C, device=self.device, dtype=self.unet.dtype)   # global S_T
+        feats = torch.randn(N_dirs, C, device=self.device, dtype=self.unet.dtype)   # [N, C]
 
         # ----- tiles -----
         tiles = spherical_to_perspective_tiles(dirs=dirs, H=tile_h, W=tile_w, fov_deg=fov_deg, overlap=overlap)
