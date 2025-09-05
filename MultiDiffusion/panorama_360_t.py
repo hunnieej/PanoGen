@@ -24,11 +24,7 @@ from projection import (generate_fibonacci_lattice,
                    perspective_to_spherical_latent,
                    stitch_final_erp_from_tiles,
                    stitch_final_erp_from_tiles_xl,
-                   stitch_final_erp_from_tiles_35,
-                   erp_to_tiles,
-                   erp_tile_dynamic_discretize,
-                   perspective_to_erp_latent,
-                   erp_sample_to_spherical_latent
+                   stitch_final_erp_from_tiles_35
                    )
 
 from utils import (make_timestep_1d,
@@ -364,6 +360,7 @@ class SphereDiffusion(nn.Module):
         
         return prompt_embeds, pooled_proj
 
+
     @torch.no_grad()
     def get_text_embeds_sana(self, prompt, negative_prompt="", max_sequence_length=300):
         """
@@ -437,10 +434,8 @@ class SphereDiffusion(nn.Module):
         C = self.unet.config.in_channels if hasattr(self.unet, "config") else self.unet.in_channels
         feats = torch.randn(N_dirs, C, device=self.device, dtype=self.unet.dtype)   # [N, C]
 
-        # ----- Spherical tiles -----
-        # tiles = spherical_to_perspective_tiles(dirs=dirs, H=tile_h, W=tile_w, fov_deg=fov_deg, overlap=overlap)
-        # ---- ERP tiles ----
-        tiles = erp_to_tiles(dirs, H, W, fov_deg=fov_deg, overlap=overlap)
+        # ----- tiles -----
+        tiles = spherical_to_perspective_tiles(dirs=dirs, H=tile_h, W=tile_w, fov_deg=fov_deg, overlap=overlap)
         tau = 0.6 * math.tan(math.radians(fov_deg) * 0.5)  # distortion-aware weight
         if save_tile_panorama:
             save_tiles_on_panorama(tiles, pano_H=H, pano_W=W,
@@ -609,87 +604,45 @@ class SphereDiffusion(nn.Module):
                 )
             return erp  # [3,H,W] in [0,1]
 
-        def _save_tile_if_needed(eps_tile, tile_idx, step_idx, outfolder):
-            if not save_tile_intermediate: return
-            if step_idx % 10 != 0 and step_idx != (len(self.scheduler.timesteps)-1): return
-
-            # VAE decode
-            sf = float(getattr(self.vae.config, "scaling_factor", 1.0))
-            sh = float(getattr(self.vae.config, "shift_factor", 0.0))
-            lat = (eps_tile.unsqueeze(0).to(torch.float32) / sf) + sh
-            lat = lat.to(self.vae.device, dtype=torch.float32)
-
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", enabled=False):
-                    dec = self.vae.decode(lat).sample[0].to(torch.float32)
-
-            tile_img = (dec / 2 + 0.5).clamp(0, 1)
-            T.ToPILImage()(tile_img.cpu()).save(
-                os.path.join(outfolder, f"tile_{tile_idx:03d}_step{step_idx:03d}.png")
-            )
-
         def _save_erp_if_needed(feats_spherical, step_idx):
             if not save_intermediate: return
-            # if step_idx % 10 != 0 and step_idx != (len(self.scheduler.timesteps)-1): return
+            if step_idx % 10 != 0 and step_idx != (len(self.scheduler.timesteps)-1): return
             erp_mid = _decode_erp_from_feats(feats_spherical)
             T.ToPILImage()(erp_mid.cpu()).save(os.path.join(outfolder, f"step_{step_idx:03d}.png"))
 
-        # ===== diffusion loop (ERP-based) =====
+        # ===== diffusion loop =====
         self.scheduler.set_timesteps(num_inference_steps)
         total_steps = len(self.scheduler.timesteps)
-        print(f"[INFO] Using ERP-based latent pipeline")
-
-        # ---- diffusion ----
-        with tqdm(total=total_steps, desc='Generating panorama (ERP)') as pbar:
+        print(f"[INFO] Output folder ready: {outfolder}")
+        if save_intermediate:
+            print(f"[INFO] Will save {len(tiles)} tiles × {num_inference_steps} steps = {len(tiles)*num_inference_steps} tile images")
+        
+        with tqdm(total=total_steps, desc='Generating panorama') as pbar:
             for step_idx, t_scalar in enumerate(self.scheduler.timesteps):
                 tile_eps_list = []
-
-                # 1) 각 타일별 dynamic discretization + U-Net forward
                 for tile_idx, tile in enumerate(tiles):
-                    tile = erp_tile_dynamic_discretize(dirs, tile)
-                    # Ht, Wt = tile["H"], tile["W"]
-                    Ht, Wt = self.H_lat, self.W_lat
-
-                    # spherical feats → tile latent (perspective patch)
-                    flat = torch.zeros(Ht*Wt, C, device=self.device, dtype=self.unet.dtype)
-                    flat.index_copy_(0, tile["lin_coords"].long(), feats[tile["used_idx"].long()])
-                    I = flat.view(Ht, Wt, C).permute(2,0,1).unsqueeze(0)   # [1,C,Ht,Wt]
-
+                    I = _gather_tile(feats, tile, C)
                     latent_in = torch.cat([I, I], dim=0) if use_cfg else I
                     cond_kwargs = _make_cond_kwargs(latent_in.shape[0])
+                    noise = _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs)  # [B,C,Ht,Wt]
 
-                    # U-Net
-                    noise = _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs)
-                    eps_tile = _apply_cfg(noise) if use_cfg else noise
+                    eps_tile = _apply_cfg(noise) if use_cfg else noise                 # [1,C,Ht,Wt]
+                    tile_eps_list.append(eps_tile.squeeze(0))                          # [C,Ht,Wt]
+                    _save_tile_preview_if_needed(eps_tile.squeeze(0), I, step_idx, tile_idx)
 
-                    # 저장용
-                    tile_eps_list.append((tile, eps_tile.squeeze(0)))
-
-                    # ---- 타일별 저장 (옵션) ----
-                    _save_tile_if_needed(eps_tile.squeeze(0), tile_idx, step_idx, outfolder)
-
-                # 2) 타일 결과 → ERP latent 업데이트
-                eps_feats = torch.stack([eps for _, eps in tile_eps_list], dim=0)  # [T,C,Ht,Wt]
-                feats_erp = perspective_to_erp_latent(eps_feats,
-                                                    [t for t,_ in tile_eps_list],
-                                                    H, W, tau=0.6)
-
-                # 3) ERP latent → spherical latent
-                fused_eps = erp_sample_to_spherical_latent(feats_erp, dirs)  # [N_dirs, C]
-
-                # 4) Scheduler step
-                feats = self.scheduler.step(model_output=fused_eps,
-                                            timestep=t_scalar,
-                                            sample=feats).prev_sample
-
-                # 5) ERP 저장
+                eps_tiles = torch.stack(tile_eps_list, dim=0)  # [T,C,Ht,Wt]
+                fused_eps = perspective_to_spherical_latent(
+                    perspective_feats=eps_tiles, tiles_info=tiles, sphere_dirs=dirs, tau=tau
+                )  # [N_dirs, C]
+                feats = self.scheduler.step(model_output=fused_eps, timestep=t_scalar, sample=feats).prev_sample
+                # ---- save mid ERP (명시적 호출) ----
                 _save_erp_if_needed(feats, step_idx)
+
                 pbar.update(1)
 
-        # ===== 최종 디코드 =====
+        # ===== final decode =====
         erp_img = _decode_erp_from_feats(feats)
         return T.ToPILImage()(erp_img.cpu())
-
     
 ########################################################################################################
 

@@ -207,116 +207,76 @@ def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tenso
 
     return H, W, used_idx, lin_coords, rc_coords, uv_sel
 
-def project_dynamic_sampling_erp(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tensor,
-                             H: int = None, W: int = None):
-    """
-    dirs: [M,3] (subset), R: world->camera, K: intrinsics
-    """
-    # world->camera
-    X = dirs @ R
-    z = X[:, 2]
-    # vis 부호 자동 선택 (가장 많은 쪽)
-    pos = (z > 1e-6).sum()
-    neg = (z < -1e-6).sum()
-    if pos >= neg:
-        vis = z > 1e-6
-    else:
-        vis = z < -1e-6
-        X = -X       # 뒤집어도 됨(픽셀 위치만 중요하면 동일)
-
-    vis_idx = torch.nonzero(vis, as_tuple=False).squeeze(1)
-    if vis_idx.numel() == 0:
-        # 안전 반환 (빈 타일)
-        H = H or 2; W = W or 2
-        emptyL = torch.empty(0, dtype=torch.long, device=dirs.device)
-        empty2 = torch.empty(0, 2, dtype=torch.long, device=dirs.device)
-        emptyuv = torch.empty(0, 2, dtype=dirs.dtype, device=dirs.device)
-        return H, W, emptyL, emptyL, empty2, emptyuv
-
-    Xv = X[vis]
-    homog = (K @ Xv.T).T
-    denom = torch.where(homog[:,2].abs() < 1e-12, torch.full_like(homog[:,2], 1e-12), homog[:,2])
-    uv = torch.stack([homog[:, 0] / denom, homog[:, 1] / denom], dim=-1)  # [M,2]
-
-    H, W, pick_in_vis, lin_coords, rc_coords = dynamic_sampling_indices(uv, H, W, K=K)
-    used_idx = vis_idx[pick_in_vis]
-    uv_sel = uv[pick_in_vis]
-    return H, W, used_idx, lin_coords, rc_coords, uv_sel
-
 # ------------------------------------------------------------------------
 # F : S -> I
 # ----------------------------------------------------------------------
-def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=50.0, overlap=0.6):
-    K = make_intrinsic(H, W, fov_deg, device=dirs.device, dtype=dirs.dtype)
-    yaws, pitches = make_view_centers(fov_deg=fov_deg, overlap=overlap)
-
-    tiles = []
-    for pitch_deg in pitches:
-        for yaw_deg in yaws:
-            yaw = math.radians(yaw_deg)
-            pitch = math.radians(pitch_deg)
-
-            # +Z convention
-            look_dir = torch.tensor([math.cos(pitch)*math.sin(yaw),
-                                     math.sin(pitch),
-                                     math.cos(pitch)*math.cos(yaw)],
-                                    device=dirs.device, dtype=dirs.dtype)
-            R = make_extrinsic(look_dir)
-
-            Ht, Wt, used_idx, lin_coords, rc_coords, uv_sel = project_dynamic_sampling(
-                dirs, R, K, H=H, W=W
-            )
-
-            tiles.append({
-                "yaw": yaw_deg, "pitch": pitch_deg,
-                "R": R, "K": K,
-                "H": Ht, "W": Wt,
-                "used_idx": used_idx,
-                "lin_coords": lin_coords,
-                "rc_coords": rc_coords,
-                "uv_sel": uv_sel,
-            })
-    return tiles
-# ------------------------------------------------------------------------
-
-# def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=80.0, overlap=0.6):
-#     # 항상 역행렬/기하 연산은 fp32로
-#     orig_dtype = dirs.dtype
-#     fp = torch.float32
-#     dev = dirs.device
-
-#     K = make_intrinsic(H, W, fov_deg, device=dev, dtype=fp)  # fp32 강제
-#     yaws, pitches = make_view_centers_89()
-
-#     # 역행렬은 루프 밖에서 1회
-#     K_inv = torch.linalg.inv(K)  # fp32
+# def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=50.0, overlap=0.6):
+#     K = make_intrinsic(H, W, fov_deg, device=dirs.device, dtype=dirs.dtype)
+#     yaws, pitches = make_view_centers(fov_deg=fov_deg, overlap=overlap)
 
 #     tiles = []
-#     for yaw_deg, pitch_deg in zip(yaws, pitches):
-#         yaw = math.radians(yaw_deg)
-#         pitch = math.radians(pitch_deg)
+#     for pitch_deg in pitches:
+#         for yaw_deg in yaws:
+#             yaw = math.radians(yaw_deg)
+#             pitch = math.radians(pitch_deg)
 
-#         # +Z convention → fp32로 계산
-#         look_dir = torch.tensor([math.cos(pitch)*math.sin(yaw),
-#                                  math.sin(pitch),
-#                                  math.cos(pitch)*math.cos(yaw)],
-#                                 device=dev, dtype=fp)
-#         R = make_extrinsic(look_dir).to(fp)  # fp32
+#             # +Z convention
+#             look_dir = torch.tensor([math.cos(pitch)*math.sin(yaw),
+#                                      math.sin(pitch),
+#                                      math.cos(pitch)*math.cos(yaw)],
+#                                     device=dirs.device, dtype=dirs.dtype)
+#             R = make_extrinsic(look_dir)
 
-#         Ht, Wt, used_idx, lin_coords, rc_coords, uv_sel = project_dynamic_sampling(
-#             dirs, R.to(orig_dtype), K.to(orig_dtype), H=H, W=W
-#         )
+#             Ht, Wt, used_idx, lin_coords, rc_coords, uv_sel = project_dynamic_sampling(
+#                 dirs, R, K, H=H, W=W
+#             )
 
-#         tiles.append({
-#             "yaw": yaw_deg, "pitch": pitch_deg,
-#             "R": R.to(orig_dtype), "K": K.to(orig_dtype),               # 원래 dtype으로 보관
-#             "H": Ht, "W": Wt,
-#             "used_idx": used_idx,
-#             "lin_coords": lin_coords,
-#             "rc_coords": rc_coords,
-#             "uv_sel": uv_sel,
-#         })
+#             tiles.append({
+#                 "yaw": yaw_deg, "pitch": pitch_deg,
+#                 "R": R, "K": K,
+#                 "H": Ht, "W": Wt,
+#                 "used_idx": used_idx,
+#                 "lin_coords": lin_coords,
+#                 "rc_coords": rc_coords,
+#                 "uv_sel": uv_sel,
+#             })
 #     return tiles
+# ------------------------------------------------------------------------
+
+def spherical_to_perspective_tiles(dirs: torch.Tensor, H, W, fov_deg=80.0, overlap=0.6):
+    orig_dtype = dirs.dtype
+    fp = torch.float32
+    dev = dirs.device
+
+    K = make_intrinsic(H, W, fov_deg, device=dev, dtype=fp)
+    yaws, pitches = make_view_centers_89()
+
+    tiles = []
+    for yaw_deg, pitch_deg in zip(yaws, pitches):
+        yaw = math.radians(yaw_deg)
+        pitch = math.radians(pitch_deg)
+
+        # +Z convention
+        look_dir = torch.tensor([math.cos(pitch)*math.sin(yaw),
+                                 math.sin(pitch),
+                                 math.cos(pitch)*math.cos(yaw)],
+                                device=dev, dtype=fp)
+        R = make_extrinsic(look_dir).to(fp)  # fp32
+
+        Ht, Wt, used_idx, lin_coords, rc_coords, uv_sel = project_dynamic_sampling(
+            dirs, R.to(orig_dtype), K.to(orig_dtype), H=H, W=W
+        )
+
+        tiles.append({
+            "yaw": yaw_deg, "pitch": pitch_deg,
+            "R": R.to(orig_dtype), "K": K.to(orig_dtype),
+            "H": Ht, "W": Wt,
+            "used_idx": used_idx,
+            "lin_coords": lin_coords,
+            "rc_coords": rc_coords,
+            "uv_sel": uv_sel,
+        })
+    return tiles
 
 
 ##########################################################################################################################
@@ -366,180 +326,6 @@ def perspective_to_spherical_latent(
         torch.zeros_like(accum),
     )
     return spherical_feats  # [N_dirs, C]
-
-##########################################################################################################################
-# NOTE : Sphere - ERP - Perspective
-##########################################################################################################################
-# ====================== ERP-based projection helpers (ADD) ======================
-
-def dirs_to_erp_uv(dirs: torch.Tensor, H_erp: int, W_erp: int):
-    """
-    dirs: [N,3] unit vectors (x,y,z) with +Z forward, +X right, +Y up
-    return: uv_px [N,2] in pixel coords (float), 수평 wrap, 수직 clamp
-    """
-    x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
-    lon = torch.atan2(x, z)                          # [-π, π]
-    lat = torch.asin(y.clamp(-1, 1))                 # [-π/2, π/2]
-    u = (lon / (2 * math.pi) + 0.5) * W_erp         # [0,W)
-    v = (0.5 - lat / math.pi) * H_erp               # [0,H]
-    # float로 유지 (후단에서 floor/long)
-    u = torch.remainder(u, W_erp)
-    v = torch.clamp(v, 0, H_erp - 1)
-    return torch.stack([u, v], dim=-1)              # [N,2], float
-
-def erp_rect_from_center_fov(yaw_deg: float, pitch_deg: float,
-                             fov_deg: float, H_erp: int, W_erp: int):
-    """
-    ERP 상 정사각 타일 bbox(px). 폭=W*(FOV/360), 높이=H*(FOV/180).
-    """
-    w_px = max(2, int(round(W_erp * (fov_deg / 360.0))))
-    h_px = max(2, int(round(H_erp * (fov_deg / 180.0))))
-    u_c = (yaw_deg % 360.0) / 360.0 * W_erp
-    v_c = (90.0 - pitch_deg) / 180.0 * H_erp
-    u0 = int(math.floor(u_c - w_px * 0.5))
-    v0 = int(math.floor(v_c - h_px * 0.5))
-    # 수직은 clamp, 수평은 wrap을 위해 음수 허용
-    v0 = max(0, min(H_erp - h_px, v0))
-    return u0, v0, h_px, w_px
-
-def erp_to_tiles(dirs: torch.Tensor, H_erp: int, W_erp: int,
-                 fov_deg: float = 80.0, overlap: float = 0.6,
-                 use_89_views: bool = False):
-    device, dtype = dirs.device, dirs.dtype
-
-    # 타일 중심
-    if use_89_views:
-        yaws, pitches = make_view_centers_89()
-    else:
-        yaws, pitches = make_view_centers(fov_deg=fov_deg, overlap=overlap)
-
-    # 모든 방향의 ERP 픽셀 (float)
-    uv_all = dirs_to_erp_uv(dirs, H_erp, W_erp)     # [N,2]
-    u_all = torch.floor(uv_all[:, 0]).long() % W_erp
-    v_all = torch.floor(uv_all[:, 1]).long().clamp(0, H_erp-1)
-
-    tiles = []
-    for pitch_deg in pitches:
-        for yaw_deg in yaws:
-            u0, v0, Ht, Wt = erp_rect_from_center_fov(yaw_deg, pitch_deg, fov_deg, H_erp, W_erp)
-            # 수평 래핑: 원형 거리 기반 포함 여부
-            u0_mod = u0 % W_erp
-            in_u = ((u_all - u0_mod) % W_erp) < Wt
-            # 수직은 단순 구간
-            in_v = (v_all >= v0) & (v_all < v0 + Ht)
-            subset_idx = torch.nonzero(in_u & in_v, as_tuple=False).squeeze(1)
-
-            yaw = math.radians(yaw_deg); pitch = math.radians(pitch_deg)
-            look_dir = torch.tensor([math.cos(pitch)*math.sin(yaw),
-                                     math.sin(pitch),
-                                     math.cos(pitch)*math.cos(yaw)],
-                                    device=device, dtype=dtype)
-            R = make_extrinsic(look_dir)  # world->camera
-            K = make_intrinsic(Ht, Wt, fov_deg, device=device, dtype=dtype)
-
-            tiles.append({
-                "yaw": yaw_deg, "pitch": pitch_deg,
-                "erp_u0": u0, "erp_v0": v0, "H": Ht, "W": Wt,
-                "subset_idx": subset_idx,      # 후보 dir 인덱스
-                "R": R, "K": K,                # world->cam, intrinsics
-            })
-    return tiles
-
-def erp_tile_dynamic_discretize(dirs: torch.Tensor, tile: dict):
-    """
-    ERP 타일 한 개에 대해, 후보 dir만 골라 project_dynamic_sampling 적용.
-    """
-    subset_idx = tile["subset_idx"]
-    if subset_idx.numel() == 0:
-        # 빈 후보 → 빈 타일로 표기
-        tile.update({
-            "used_idx": torch.empty(0, dtype=torch.long, device=dirs.device),
-            "lin_coords": torch.empty(0, dtype=torch.long, device=dirs.device),
-            "rc_coords": torch.empty(0, 2, dtype=torch.long, device=dirs.device),
-            "uv_sel": torch.empty(0, 2, dtype=dirs.dtype, device=dirs.device)
-        })
-        return tile
-
-    subset = dirs[subset_idx].to(torch.float32)
-    Ht, Wt = tile["H"], tile["W"]
-    R, K = tile["R"].to(torch.float32), tile["K"].to(torch.float32)
-
-    # ★ R은 world->camera 그대로 넘긴다 (R.T 금지)
-    H, W, used_subset, lin_coords, rc_coords, uv_sel = project_dynamic_sampling_erp(
-        subset, R, K, H=Ht, W=Wt
-    )
-    used_idx = subset_idx[used_subset]
-
-    tile.update({
-        "H": H, "W": W,
-        "used_idx": used_idx,
-        "lin_coords": lin_coords,
-        "rc_coords": rc_coords,
-        "uv_sel": uv_sel
-    })
-    return tile
-
-def perspective_to_erp_latent(
-    perspective_feats: torch.Tensor,  # [T,C,Ht,Wt] (타일별)
-    tiles: list,
-    H_erp: int, W_erp: int,
-    tau: float = 0.5
-):
-    device = perspective_feats.device
-    C = perspective_feats.shape[1]
-    accum = torch.zeros(C, H_erp, W_erp, device=device, dtype=perspective_feats.dtype)
-    wsum  = torch.zeros(1, H_erp, W_erp, device=device, dtype=perspective_feats.dtype)
-
-    for t_idx, tile in enumerate(tiles):
-        Ht, Wt = tile["H"], tile["W"]
-        if Ht == 0 or Wt == 0:   # 빈 타일 방어
-            continue
-        u0, v0 = tile["erp_u0"], tile["erp_v0"]
-        F = perspective_feats[t_idx]                      # [C,Ht,Wt]
-
-        # 중심우대 weight
-        jj = torch.arange(Ht, device=device, dtype=F.dtype) + 0.5
-        ii = torch.arange(Wt, device=device, dtype=F.dtype) + 0.5
-        v, u = torch.meshgrid(jj, ii, indexing='ij')
-        u_n = (u - Wt/2) / (Wt/2); v_n = (v - Ht/2) / (Ht/2)
-        r = torch.sqrt(u_n**2 + v_n**2).clamp(0, 1)
-        w = torch.exp(-r / max(tau, 1e-6)).unsqueeze(0)   # [1,Ht,Wt]
-
-        # 수평 wrap, 수직 clamp
-        yy = (v0 + torch.arange(Ht, device=device)).clamp(0, H_erp-1).long()  # [Ht]
-        xx = (u0 + torch.arange(Wt, device=device)) % W_erp                  # [Wt]
-
-        # 2D scatter-add (벡터화)
-        Y = yy.view(Ht, 1).expand(Ht, Wt).reshape(-1)        # [Ht*Wt]
-        X = xx.view(1, Wt).expand(Ht, Wt).reshape(-1)        # [Ht*Wt]
-        idx = (Y * W_erp + X).long()                         # [Ht*Wt]
-        # NaN 방지
-        Ww = w.view(-1).nan_to_num(0.0)
-        for c in range(C):
-            accum.view(C, -1)[c].index_add_(0, idx, (F[c].reshape(-1) * Ww))
-        wsum.view(-1).index_add_(0, idx, Ww)
-
-    wsum[wsum == 0] = 1.0
-    return accum / wsum
-
-def erp_sample_to_spherical_latent(erp_latent: torch.Tensor, dirs: torch.Tensor):
-    """
-    ERP latent [C,H,W]를 각 방향(dirs) 위치에서 bilinear sample하여 [N,C]로 반환.
-    """
-    device = erp_latent.device
-    C, H, W = erp_latent.shape
-    x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
-    lon = torch.atan2(x, z)                                # [-π,π]
-    lat = torch.asin(y.clamp(-1, 1))                       # [-π/2,π/2]
-    u = (lon / (2 * math.pi) + 0.5) * (W - 1)
-    v = (0.5 - lat / math.pi) * (H - 1)
-    # grid_sample용 정규화 좌표 (-1..1)
-    gx = (u / (W - 1)) * 2 - 1
-    gy = (v / (H - 1)) * 2 - 1
-    grid = torch.stack([gx, gy], dim=-1).view(1, -1, 1, 2) # [1,N,1,2]
-    feat = F.grid_sample(erp_latent.unsqueeze(0), grid, mode='bilinear',
-                         padding_mode='border', align_corners=True)  # [1,C,N,1]
-    return feat.squeeze(0).squeeze(-1).transpose(0, 1)               # [N,C]
 
 ##########################################################################################################################
 # NOTE : ERP Splatting
