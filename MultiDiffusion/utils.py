@@ -63,7 +63,7 @@ def _edge_uvs_for_tile(tile: dict, step: int, pano_H: int, pano_W: int) -> list:
         # rows/cols: [L]
         fx, fy = K[0,0], K[1,1]; cx, cy = K[0,2], K[1,2]
         u_n = (cols.to(dt) - cx) / fx
-        v_n = (rows.to(dt) - cy) / fy
+        v_n = - (rows.to(dt) - cy) / fy
         d_cam = torch.stack([u_n, v_n, torch.ones_like(u_n)], dim=-1)  # [L,3]
         d_cam = d_cam / torch.linalg.norm(d_cam, dim=-1, keepdim=True)
         R_ = R.to(dtype=dt, device=dev)

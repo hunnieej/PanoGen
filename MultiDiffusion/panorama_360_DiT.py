@@ -16,9 +16,9 @@ from diffusers import (AutoencoderKL,
 # functions : Sphere - S^2 - ERP 관련 함수 넣기
 # utils : 그 외 다른 함수들 넣기
 from projection_DiT import (generate_fibonacci_lattice, 
-                   spherical_to_perspective_tiles, 
-                   perspective_to_spherical_latent,
-                   stitch_final_erp_from_tiles,
+                   spherical_to_perspective_tiles_tokenized,
+                   fuse_perspective_to_spherical,
+                   stitch_final_erp_from_tiles_SANA,
                    stitch_final_erp_from_tiles_35
                    )
 
@@ -308,7 +308,13 @@ class SphereDiffusion(nn.Module):
         feats = torch.randn(N_dirs, C, device=self.device, dtype=self.transformer.dtype)   # [N, C]
 
         # ----- tiles -----
-        tiles = spherical_to_perspective_tiles(dirs=dirs, H=tile_h, W=tile_w, fov_deg=fov_deg, overlap=overlap)
+        # tiles = spherical_to_perspective_tiles_tokenized(dirs=dirs, 
+        #                                                  Hp=tile_h, Wp=tile_w, 
+        #                                                  fov_deg=fov_deg)
+        tiles = spherical_to_perspective_tiles_tokenized(dirs=dirs, 
+                                                         Hp=tile_h, Wp=tile_w, 
+                                                         fov_deg=fov_deg)
+
         tau = 0.6 * math.tan(math.radians(fov_deg) * 0.5)  # distortion-aware weight
         if save_tile_panorama:
             save_tiles_on_panorama(tiles, pano_H=H, pano_W=W,
@@ -348,7 +354,7 @@ class SphereDiffusion(nn.Module):
             else:
                 return dict(encoder_hidden_states=text_cond['embeds'])
 
-        def _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs):
+        def _transformer_forward(latent_in, t_scalar, cond_kwargs):
             if self.rf_version =='SANA':
                 lin = self.scheduler.scale_model_input(latent_in, t_scalar)
                 t_in = make_timestep_1d(t_scalar, latent_in.shape[0], self.device, float_for_dit=True)
@@ -360,7 +366,7 @@ class SphereDiffusion(nn.Module):
                 out = self.transformer(
                     hidden_states=lin,
                     timestep=t_in,
-                    **cond_kwargs,             # encoder_hidden_states + pooled_projections
+                    **cond_kwargs,
                     return_dict=True
                 ).sample
             return out
@@ -372,19 +378,18 @@ class SphereDiffusion(nn.Module):
 
         def _gather_tile(feats_global, tile, C):
             used_idx = tile["used_idx"].long()
-            lin = tile["lin_coords"].long()
-            Ht, Wt = tile["H"], tile["W"]
-            flat = torch.zeros(Ht * Wt, C, device=self.device, dtype=self.transformer.dtype)
+            lin      = tile["lin_coords"].long()
+            Hp, Wp   = int(tile["H"]), int(tile["W"])
+            flat = torch.zeros(Hp * Wp, C, device=self.device, dtype=self.transformer.dtype)
             flat.index_copy_(0, lin, feats_global[used_idx])
-            return flat.view(Ht, Wt, C).permute(2,0,1).unsqueeze(0)  # [1,C,Ht,Wt]
+            return flat.view(Hp, Wp, C).permute(2, 0, 1).unsqueeze(0)
 
         def _save_tile_preview_if_needed(tile_eps, I_bchw, step_idx, tile_idx):
-            if not save_tile_intermediate or not(step_idx % 5 == 0 or step_idx % 49 == 0):
+            if not save_tile_intermediate or not(step_idx % 10 == 0 or step_idx % 49 == 0):
                 return
 
             tmp_sched = copy.deepcopy(self.scheduler)
             t_prev = tmp_sched.timesteps[step_idx]
-
             step_res = tmp_sched.step(model_output=tile_eps.unsqueeze(0), timestep=t_prev, sample=I_bchw)
             xprev = step_res.prev_sample
             if xprev.dim() == 5 and xprev.shape[1] == 1:
@@ -395,7 +400,6 @@ class SphereDiffusion(nn.Module):
             sf = float(getattr(self.vae.config, "scaling_factor", 1.0))
             sh = float(getattr(self.vae.config, "shift_factor", 0.0))
 
-            # ---- 모델별 디코드 정책
             if self.rf_version == 'SANA':
                 autocast_enabled = True
                 vae_in_dtype = torch.bfloat16
@@ -406,7 +410,7 @@ class SphereDiffusion(nn.Module):
                 if force_upcast:
                     self.vae.to(dtype=torch.float32)
                     vae_in_dtype = torch.float32
-                    autocast_enabled = False   # fp32 디코드
+                    autocast_enabled = False
                 else:
                     vae_in_dtype = getattr(self.vae, "dtype", torch.bfloat16)
                     autocast_enabled = (vae_in_dtype in (torch.bfloat16, torch.float16))
@@ -415,7 +419,6 @@ class SphereDiffusion(nn.Module):
 
             lat = lat.to(device=self.vae.device, dtype=vae_in_dtype)
 
-            # ---- 디코딩: fp32면 autocast OFF, bf16/half면 해당 dtype으로 ON
             if autocast_enabled and vae_in_dtype != torch.float32:
                 with torch.autocast(device_type='cuda', enabled=True, dtype=vae_in_dtype):
                     dec = self.vae.decode(lat).sample  # [-1,1]
@@ -432,10 +435,10 @@ class SphereDiffusion(nn.Module):
                     pano_H=H, pano_W=W, fov_deg=fov_deg
                 )
             else:
-                erp = stitch_final_erp_from_tiles(
+                erp = stitch_final_erp_from_tiles_SANA(
                     feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
                     scale=1/0.41407,
-                    pano_H=H, pano_W=W, fov_deg=fov_deg, rf_version=self.rf_version
+                    pano_H=H, pano_W=W, fov_deg=fov_deg
                 )
             return erp  # [3,H,W] in [0,1]
 
@@ -459,18 +462,18 @@ class SphereDiffusion(nn.Module):
                     I = _gather_tile(feats, tile, C)
                     latent_in = torch.cat([I, I], dim=0) if use_cfg else I
                     cond_kwargs = _make_cond_kwargs(latent_in.shape[0])
-                    noise = _unet_forward(latent_in, step_idx, t_scalar, cond_kwargs)  # [B,C,Ht,Wt]
+                    noise = _transformer_forward(latent_in, t_scalar, cond_kwargs)  # [B,C,Ht,Wt]
 
                     eps_tile = _apply_cfg(noise) if use_cfg else noise                 # [1,C,Ht,Wt]
                     tile_eps_list.append(eps_tile.squeeze(0))                          # [C,Ht,Wt]
                     _save_tile_preview_if_needed(eps_tile.squeeze(0), I, step_idx, tile_idx)
 
                 eps_tiles = torch.stack(tile_eps_list, dim=0)  # [T,C,Ht,Wt]
-                fused_eps = perspective_to_spherical_latent(
-                    perspective_feats=eps_tiles, tiles_info=tiles, sphere_dirs=dirs, tau=tau
+                fused_eps = fuse_perspective_to_spherical(
+                    tile_feats=eps_tiles, tiles_info=tiles, 
+                    sphere_dirs=dirs, tau=tau
                 )  # [N_dirs, C]
                 feats = self.scheduler.step(model_output=fused_eps, timestep=t_scalar, sample=feats).prev_sample
-                # ---- save mid ERP (명시적 호출) ----
                 _save_erp_if_needed(feats, step_idx)
 
                 pbar.update(1)
@@ -524,4 +527,4 @@ if __name__ == '__main__':
     img.save(final_filename)
     print(f"[INFO] Saved final result: {final_filename}")
 
-########################################################################################################
+######################################################################################################## 
