@@ -7,8 +7,9 @@
 [![Replicate](https://replicate.com/cjwbw/multidiffusion/badge)](https://replicate.com/cjwbw/multidiffusion) -->
 
 
-## Baseline MultiDiffusion: Fusing Diffusion Paths for Controlled Image Generation (ICML 2023)
-## [<a href="https://multidiffusion.github.io/" target="_blank">Project Page</a>] **MultiDiffusion** is a unified framework that enables versatile and controllable image generation, using a pre-trained text-to-image diffusion model, without any further training or finetuning, as described in <a href="https://arxiv.org/abs/2302.08113" target="_blank">(link to paper)</a>.
+## Baseline
+### MultiDiffusion: Fusing Diffusion Paths for Controlled Image Generation (ICML 2023)
+### [<a href="https://multidiffusion.github.io/" target="_blank">Project Page</a>] <a href="https://arxiv.org/abs/2302.08113" target="_blank">(link to paper)</a>.
 
 
 
