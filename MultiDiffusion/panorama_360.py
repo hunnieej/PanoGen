@@ -10,7 +10,6 @@ from transformers import (CLIPTextModel,
 from diffusers import (AutoencoderKL, 
                        UNet2DConditionModel, 
                        DDIMScheduler,
-                       EulerDiscreteScheduler, #SDXL
                        DPMSolverMultistepScheduler, #SANA
                        FlowMatchEulerDiscreteScheduler, #SD v3.5
                        SanaTransformer2DModel,
@@ -23,7 +22,6 @@ from projection import (generate_fibonacci_lattice,
                    spherical_to_perspective_tiles, 
                    perspective_to_spherical_latent,
                    stitch_final_erp_from_tiles,
-                   stitch_final_erp_from_tiles_xl,
                    stitch_final_erp_from_tiles_35
                    )
 
@@ -66,8 +64,6 @@ class SphereDiffusion(nn.Module):
             model_key = "stabilityai/stable-diffusion-2-base"
         elif self.rf_version == '1.5':
             model_key = "runwayml/stable-diffusion-v1-5"
-        elif self.rf_version =='xl':
-            model_key = "stabilityai/stable-diffusion-xl-base-1.0"
         elif self.rf_version == '3.5':
             model_key = "stabilityai/stable-diffusion-3.5-medium"
         elif self.rf_version == 'SANA':
@@ -95,14 +91,6 @@ class SphereDiffusion(nn.Module):
             self.unet = SD3Transformer2DModel.from_pretrained(model_key, subfolder="transformer", torch_dtype=torch.bfloat16).to(self.device)
             self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_key, subfolder="scheduler")
         # UNet 기반 
-        elif self.rf_version == 'xl':
-            self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.tokenizer_1 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-            self.tokenizer_2 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer_2")
-            self.text_encoder_1 = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_key, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.scheduler = EulerDiscreteScheduler.from_pretrained(model_key, subfolder="scheduler")
         else: #SD v1.5 / 2.0 / 2.1
             # dtype : float32
             self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
@@ -128,84 +116,6 @@ class SphereDiffusion(nn.Module):
         # Cat for final embeddings
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         return text_embeddings
-    
-    @torch.no_grad()
-    def get_text_embeds_xl(self, prompt, negative_prompt="", *,
-                           prompt_2=None, negative_prompt_2=None,
-                           max_length=None, height=1024, width=1024,
-                           crop_coords=(0,0), target_size=None):
-        # Normalize inputs to lists
-        if isinstance(prompt, str): prompt = [prompt]
-        B = len(prompt)
-
-        if prompt_2 is None: prompt_2 = prompt
-        if isinstance(prompt_2, str): prompt_2 = [prompt_2] * B
-
-        if isinstance(negative_prompt, str): negative_prompt = [negative_prompt] * B
-        if negative_prompt_2 is None: negative_prompt_2 = negative_prompt
-        if isinstance(negative_prompt_2, str): negative_prompt_2 = [negative_prompt_2] * B
-
-        tok1, tok2 = self.tokenizer_1, self.tokenizer_2
-        te1,  te2  = self.text_encoder_1, self.text_encoder_2
-
-        # pad token safety
-        for tok in (tok1, tok2):
-            if tok.pad_token is None:
-                tok.pad_token = getattr(tok, "eos_token", tok.unk_token)
-            tok.padding_side = "right"
-
-        def _encode_pair(tokenizer, encoder, texts, maxlen):
-            inputs = tokenizer(
-                texts,
-                padding="max_length",
-                max_length=max_length or tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            # For SDXL we want both sequence features and pooled features
-            out = encoder(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask", None),
-                output_hidden_states=True,
-            )
-            seq = out.hidden_states[-2]             # [B, L, C*]
-            # pooled: CLIPTextModel -> pooled_output, CLIPTextModelWithProjection -> text_embeds
-            if hasattr(out, "pooled_output") and out.pooled_output is not None:
-                pooled = out.pooled_output         # [B, D*]
-            elif hasattr(out, "text_embeds") and out.text_embeds is not None:
-                pooled = out.text_embeds           # [B, D*]
-            else:
-                pooled = seq[:, 0]                 # fallback: CLS
-            return seq, pooled
-
-        # cond
-        seq1_c, pooled1_c = _encode_pair(tok1, te1, prompt,   max_length)
-        seq2_c, pooled2_c = _encode_pair(tok2, te2, prompt_2, max_length)
-        # uncond (negative)
-        seq1_u, pooled1_u = _encode_pair(tok1, te1, negative_prompt,   max_length)
-        seq2_u, pooled2_u = _encode_pair(tok2, te2, negative_prompt_2, max_length)
-
-        # concat sequence features from both encoders (convention: encoder_2 || encoder_1)
-        cond_seq = torch.cat([seq2_c, seq1_c], dim=-1)   # [B, L, C2+C1]
-        uncond_seq = torch.cat([seq2_u, seq1_u], dim=-1) # [B, L, C2+C1]
-        prompt_embeds = torch.cat([uncond_seq, cond_seq], dim=0).to(dtype=self.unet.dtype, device=self.device)  # [2B, L, Ctot]
-
-        # pooled: use encoder_2 pooled (official pipeline behavior)
-        cond_pooled = pooled2_c
-        uncond_pooled = pooled2_u
-        pooled_prompt_embeds = torch.cat([uncond_pooled, cond_pooled], dim=0).to(dtype=self.unet.dtype, device=self.device)  # [2B, D2]
-
-        # micro-conditioning time ids
-        if target_size is None:
-            target_size = (height, width)
-        add_time_ids = torch.tensor(
-            [height, width, crop_coords[0], crop_coords[1], target_size[0], target_size[1]],
-            device=self.device, dtype=self.unet.dtype
-        ).repeat(prompt_embeds.shape[0], 1)  # [2B, 6]
-
-        return prompt_embeds, pooled_prompt_embeds, add_time_ids
     
     @torch.no_grad()
     def get_text_embeds_sd35(
@@ -411,7 +321,6 @@ class SphereDiffusion(nn.Module):
     @torch.no_grad()
     def text2panorama360(
         self, prompts, negative_prompts='',
-        prompt_2=None, negative_prompt_2=None,
         H=512, W=4096, num_inference_steps=50, guidance_scale=7.5,
         fov_deg=80.0, overlap=0.6, N_dirs=2600, tile_h=64, tile_w=64,
         use_cfg=True, outfolder='out',
@@ -451,14 +360,6 @@ class SphereDiffusion(nn.Module):
                     embeds=embeds.to(self.unet.dtype).to(self.device),
                     attn=attn
                 )
-            elif self.rf_version == 'xl':
-                pe, pooled, time_ids = self.get_text_embeds_xl(prompts, negative_prompts)
-                return dict(
-                    kind='xl',
-                    prompt_embeds=pe.to(self.unet.dtype).to(self.device),
-                    pooled=pooled.to(self.unet.dtype).to(self.device),
-                    time_ids=time_ids.to(self.unet.dtype).to(self.device)
-                )
             elif self.rf_version == '3.5':
                 pe, pooled = self.get_text_embeds_sd35(prompts, negative_prompts)
                 return dict(
@@ -486,10 +387,6 @@ class SphereDiffusion(nn.Module):
                     # pooled_projections=dict(text_embeds=text_cond['pooled'])
                     pooled_projections=text_cond['pooled']
                 )
-            elif text_cond['kind'] == 'xl':
-                return dict(encoder_hidden_states=text_cond['prompt_embeds'],
-                            added_cond_kwargs=dict(text_embeds=text_cond['pooled'],
-                                                time_ids=text_cond['time_ids']))
             else:
                 return dict(encoder_hidden_states=text_cond['embeds'])
 
@@ -508,10 +405,6 @@ class SphereDiffusion(nn.Module):
                     **cond_kwargs,             # encoder_hidden_states + pooled_projections
                     return_dict=True
                 ).sample
-            elif self.rf_version == 'xl':
-                t_model = self.scheduler.timesteps[step_idx]
-                lin = self.scheduler.scale_model_input(latent_in, t_model)
-                out = self.unet(sample=lin, timestep=t_model, **cond_kwargs, return_dict=True).sample
             else:
                 out = self.unet(sample=latent_in, timestep=t_scalar, **cond_kwargs, return_dict=True).sample
             return out
@@ -547,12 +440,7 @@ class SphereDiffusion(nn.Module):
             sh = float(getattr(self.vae.config, "shift_factor", 0.0))
 
             # ---- 모델별 디코드 정책
-            if self.rf_version == 'xl':
-                autocast_enabled = False
-                vae_in_dtype = torch.float32
-                lat = (xprev / 0.13025).to(torch.float32) + 0.0
-
-            elif self.rf_version == 'SANA':
+            if self.rf_version == 'SANA':
                 autocast_enabled = True
                 vae_in_dtype = torch.bfloat16
                 lat = (xprev / 0.41407).to(torch.float32) + 0.0
@@ -586,12 +474,7 @@ class SphereDiffusion(nn.Module):
             T.ToPILImage()(tile_img.cpu()).save(os.path.join(outfolder, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
 
         def _decode_erp_from_feats(feats_spherical):
-            if self.rf_version == 'xl':
-                erp = stitch_final_erp_from_tiles_xl(
-                    feats_spherical=feats_spherical, dirs=dirs, tiles=tiles, vae=self.vae,
-                    scale=1/0.13025, pano_H=H, pano_W=W, fov_deg=fov_deg
-                )
-            elif self.rf_version == '3.5':
+            if self.rf_version == '3.5':
                 erp = stitch_final_erp_from_tiles_35(
                     feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
                     pano_H=H, pano_W=W, fov_deg=fov_deg
@@ -650,7 +533,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--prompt', type=str, default='a photo of the dolomites')
     parser.add_argument('--negative', type=str, default='')
-    parser.add_argument('--rf_version', type=str, default='2.0', choices=['1.5', '2.0', '2.1','3.5', 'xl', 'SANA'],
+    parser.add_argument('--rf_version', type=str, default='2.0', choices=['1.5', '2.0', '2.1','3.5', 'SANA'],
                         help="Reference diffusion version")
     parser.add_argument('--H', type=int, default=512, help="Panorama height")
     parser.add_argument('--W', type=int, default=4096, help="Panorama width")
@@ -676,7 +559,6 @@ if __name__ == '__main__':
     sd = SphereDiffusion(device, opt.rf_version)
 
     img = sd.text2panorama360(opt.prompt, opt.negative,
-                              opt.prompt, opt.negative, # SDXL
                               opt.H, opt.W, 
                               opt.steps, opt.guidance_scale, 
                               opt.fov_deg, opt.overlap, opt.N_dirs, opt.Hlat, opt.Wlat, 

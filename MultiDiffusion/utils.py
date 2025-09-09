@@ -83,10 +83,6 @@ def _edge_uvs_for_tile(tile: dict, step: int, pano_H: int, pano_W: int) -> list:
 
 @torch.no_grad()
 def _draw_polyline_wrapped(draw: ImageDraw.ImageDraw, uvs: torch.Tensor, pano_W: int, color: tuple, width: int=2):
-    """
-    equirect의 수평 래핑을 고려해, u 차이가 크게 벌어지면 선분을 끊어서 그림.
-    uvs: [L,2] (float)
-    """
     if uvs.shape[0] < 2: return
     if uvs.dtype == torch.bfloat16:
         uvs = uvs.to(torch.float32)
@@ -120,7 +116,8 @@ def save_tiles_on_panorama(
     assert mode in ("outline", "dots"), "mode must be 'outline' or 'dots'"
 
     def _draw_subset(idx_list, out_path):
-        canvas = Image.fromarray(np.zeros((pano_H, pano_W, 3), dtype=np.uint8))
+        # canvas = Image.fromarray(np.zeros((pano_H, pano_W, 3), dtype=np.uint8))
+        canvas = Image.fromarray(np.full((pano_H, pano_W, 3), 255, dtype=np.uint8))
         draw = ImageDraw.Draw(canvas)
         N_all = len(tiles)
 

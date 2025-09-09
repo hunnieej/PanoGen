@@ -1,6 +1,5 @@
 from sched import scheduler
-from transformers import (CLIPTextModel, 
-                          CLIPTokenizer,
+from transformers import (CLIPTokenizer,
                           CLIPTextModelWithProjection, #text encoder_2 for SDXL
                           T5EncoderModel, #text encoder_3 for SD v3.5
                           T5Tokenizer, #tokenizer_3 for SD v3.5
@@ -8,9 +7,6 @@ from transformers import (CLIPTextModel,
                           Gemma2Model,
                           GemmaTokenizerFast)
 from diffusers import (AutoencoderKL, 
-                       UNet2DConditionModel, 
-                       DDIMScheduler,
-                       EulerDiscreteScheduler, #SDXL
                        DPMSolverMultistepScheduler, #SANA
                        FlowMatchEulerDiscreteScheduler, #SD v3.5
                        SanaTransformer2DModel,
@@ -19,11 +15,10 @@ from diffusers import (AutoencoderKL,
 
 # functions : Sphere - S^2 - ERP 관련 함수 넣기
 # utils : 그 외 다른 함수들 넣기
-from projection import (generate_fibonacci_lattice, 
+from projection_DiT import (generate_fibonacci_lattice, 
                    spherical_to_perspective_tiles, 
                    perspective_to_spherical_latent,
                    stitch_final_erp_from_tiles,
-                   stitch_final_erp_from_tiles_xl,
                    stitch_final_erp_from_tiles_35
                    )
 
@@ -50,7 +45,7 @@ def seed_everything(seed):
 
 ########################################################################################################
 class SphereDiffusion(nn.Module):
-    def __init__(self, device, rf_version='2.0', hf_key=None):
+    def __init__(self, device, rf_version='3.5', hf_key=None):
         super().__init__()
 
         self.device = device
@@ -60,19 +55,10 @@ class SphereDiffusion(nn.Module):
         if hf_key is not None:
             print(f'[INFO] using hugging face custom model key: {hf_key}')
             model_key = hf_key
-        elif self.rf_version == '2.1':
-            model_key = "stabilityai/stable-diffusion-2-1-base"
-        elif self.rf_version == '2.0':
-            model_key = "stabilityai/stable-diffusion-2-base"
-        elif self.rf_version == '1.5':
-            model_key = "runwayml/stable-diffusion-v1-5"
-        elif self.rf_version =='xl':
-            model_key = "stabilityai/stable-diffusion-xl-base-1.0"
         elif self.rf_version == '3.5':
             model_key = "stabilityai/stable-diffusion-3.5-medium"
         elif self.rf_version == 'SANA':
             model_key= "Efficient-Large-Model/Sana_600M_1024px_diffusers"
-
         else:
             raise ValueError(f'Reference diffusion version {self.rf_version} not supported.')
 
@@ -82,9 +68,9 @@ class SphereDiffusion(nn.Module):
             self.vae = AutoencoderDC.from_pretrained(model_key, subfolder="vae", torch_dtype=torch.bfloat16).to(self.device)
             self.tokenizer = GemmaTokenizerFast.from_pretrained(model_key, subfolder="tokenizer")
             self.text_encoder = Gemma2Model.from_pretrained(model_key, subfolder="text_encoder", torch_dtype=torch.bfloat16).to(self.device)
-            self.unet = SanaTransformer2DModel.from_pretrained(model_key, subfolder="transformer", torch_dtype=torch.bfloat16).to(self.device)
+            self.transformer = SanaTransformer2DModel.from_pretrained(model_key, subfolder="transformer", torch_dtype=torch.bfloat16).to(self.device)
             self.scheduler = DPMSolverMultistepScheduler.from_pretrained(model_key, subfolder="scheduler")
-        elif self.rf_version == '3.5':
+        else: # self.rf_version == '3.5'
             self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", torch_dtype=torch.bfloat16).to(self.device)
             self.tokenizer_1 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
             self.tokenizer_2 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer_2")
@@ -92,121 +78,10 @@ class SphereDiffusion(nn.Module):
             self.text_encoder_1 = CLIPTextModelWithProjection.from_pretrained(model_key, subfolder="text_encoder", torch_dtype=torch.bfloat16).to(self.device)
             self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_key, subfolder="text_encoder_2", torch_dtype=torch.bfloat16).to(self.device)
             self.text_encoder_3 = T5EncoderModel.from_pretrained(model_key, subfolder="text_encoder_3", torch_dtype=torch.bfloat16).to(self.device)
-            self.unet = SD3Transformer2DModel.from_pretrained(model_key, subfolder="transformer", torch_dtype=torch.bfloat16).to(self.device)
+            self.transformer = SD3Transformer2DModel.from_pretrained(model_key, subfolder="transformer", torch_dtype=torch.bfloat16).to(self.device)
             self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_key, subfolder="scheduler")
-        # UNet 기반 
-        elif self.rf_version == 'xl':
-            self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.tokenizer_1 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-            self.tokenizer_2 = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer_2")
-            self.text_encoder_1 = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_key, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet", torch_dtype=torch.float16, variant="fp16", use_safetensors=True).to(self.device)
-            self.scheduler = EulerDiscreteScheduler.from_pretrained(model_key, subfolder="scheduler")
-        else: #SD v1.5 / 2.0 / 2.1
-            # dtype : float32
-            self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
-            self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-            self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-            self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
-            self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
-        self._supports_pos_embed = False
         print(f'[INFO] loaded reference diffusion!')
-        
-    @torch.no_grad()
-    def get_text_embeds(self, prompt, negative_prompt):
-        
-        text_input = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                    truncation=True, return_tensors='pt')
-        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
 
-        # Do the same for unconditional embeddings
-        uncond_input = self.tokenizer(negative_prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
-                                      return_tensors='pt')
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
-
-        # Cat for final embeddings
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-        return text_embeddings
-    
-    @torch.no_grad()
-    def get_text_embeds_xl(self, prompt, negative_prompt="", *,
-                           prompt_2=None, negative_prompt_2=None,
-                           max_length=None, height=1024, width=1024,
-                           crop_coords=(0,0), target_size=None):
-        # Normalize inputs to lists
-        if isinstance(prompt, str): prompt = [prompt]
-        B = len(prompt)
-
-        if prompt_2 is None: prompt_2 = prompt
-        if isinstance(prompt_2, str): prompt_2 = [prompt_2] * B
-
-        if isinstance(negative_prompt, str): negative_prompt = [negative_prompt] * B
-        if negative_prompt_2 is None: negative_prompt_2 = negative_prompt
-        if isinstance(negative_prompt_2, str): negative_prompt_2 = [negative_prompt_2] * B
-
-        tok1, tok2 = self.tokenizer_1, self.tokenizer_2
-        te1,  te2  = self.text_encoder_1, self.text_encoder_2
-
-        # pad token safety
-        for tok in (tok1, tok2):
-            if tok.pad_token is None:
-                tok.pad_token = getattr(tok, "eos_token", tok.unk_token)
-            tok.padding_side = "right"
-
-        def _encode_pair(tokenizer, encoder, texts, maxlen):
-            inputs = tokenizer(
-                texts,
-                padding="max_length",
-                max_length=max_length or tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            # For SDXL we want both sequence features and pooled features
-            out = encoder(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask", None),
-                output_hidden_states=True,
-            )
-            seq = out.hidden_states[-2]             # [B, L, C*]
-            # pooled: CLIPTextModel -> pooled_output, CLIPTextModelWithProjection -> text_embeds
-            if hasattr(out, "pooled_output") and out.pooled_output is not None:
-                pooled = out.pooled_output         # [B, D*]
-            elif hasattr(out, "text_embeds") and out.text_embeds is not None:
-                pooled = out.text_embeds           # [B, D*]
-            else:
-                pooled = seq[:, 0]                 # fallback: CLS
-            return seq, pooled
-
-        # cond
-        seq1_c, pooled1_c = _encode_pair(tok1, te1, prompt,   max_length)
-        seq2_c, pooled2_c = _encode_pair(tok2, te2, prompt_2, max_length)
-        # uncond (negative)
-        seq1_u, pooled1_u = _encode_pair(tok1, te1, negative_prompt,   max_length)
-        seq2_u, pooled2_u = _encode_pair(tok2, te2, negative_prompt_2, max_length)
-
-        # concat sequence features from both encoders (convention: encoder_2 || encoder_1)
-        cond_seq = torch.cat([seq2_c, seq1_c], dim=-1)   # [B, L, C2+C1]
-        uncond_seq = torch.cat([seq2_u, seq1_u], dim=-1) # [B, L, C2+C1]
-        prompt_embeds = torch.cat([uncond_seq, cond_seq], dim=0).to(dtype=self.unet.dtype, device=self.device)  # [2B, L, Ctot]
-
-        # pooled: use encoder_2 pooled (official pipeline behavior)
-        cond_pooled = pooled2_c
-        uncond_pooled = pooled2_u
-        pooled_prompt_embeds = torch.cat([uncond_pooled, cond_pooled], dim=0).to(dtype=self.unet.dtype, device=self.device)  # [2B, D2]
-
-        # micro-conditioning time ids
-        if target_size is None:
-            target_size = (height, width)
-        add_time_ids = torch.tensor(
-            [height, width, crop_coords[0], crop_coords[1], target_size[0], target_size[1]],
-            device=self.device, dtype=self.unet.dtype
-        ).repeat(prompt_embeds.shape[0], 1)  # [2B, 6]
-
-        return prompt_embeds, pooled_prompt_embeds, add_time_ids
-    
     @torch.no_grad()
     def get_text_embeds_sd35(
         self,
@@ -231,7 +106,7 @@ class SphereDiffusion(nn.Module):
         if device is None:
             device = self.device
         if dtype is None:
-            dtype = self.unet.dtype
+            dtype = self.transformer.dtype
 
         tok1, tok2, tok3 = self.tokenizer_1, self.tokenizer_2, self.tokenizer_3
         te1, te2, te3 = self.text_encoder_1, self.text_encoder_2, self.text_encoder_3
@@ -245,7 +120,7 @@ class SphereDiffusion(nn.Module):
         d_clip1 = te1.config.hidden_size #768
         d_clip2 = te2.config.hidden_size #1280
         d_t5 = te3.config.d_model #4096
-        joint_dim = getattr(self.unet.config, "joint_attention_dim", d_t5) #4096
+        joint_dim = getattr(self.transformer.config, "joint_attention_dim", d_t5) #4096
 
         print(f"텍스트 인코더 차원: CLIP1={d_clip1}, CLIP2={d_clip2}, T5={d_t5}, Joint={joint_dim}")
 
@@ -360,7 +235,6 @@ class SphereDiffusion(nn.Module):
         
         return prompt_embeds, pooled_proj
 
-
     @torch.no_grad()
     def get_text_embeds_sana(self, prompt, negative_prompt="", max_sequence_length=300):
         """
@@ -402,7 +276,7 @@ class SphereDiffusion(nn.Module):
         uncond_emb = uncond_out.last_hidden_state
 
         embeds = torch.cat([uncond_emb, cond_emb], dim=0)         # [2B, L, C]
-        embeds = embeds.to(dtype=self.unet.dtype, device=self.device)
+        embeds = embeds.to(dtype=self.transformer.dtype, device=self.device)
         attn_mask = torch.cat([uncond["attention_mask"], cond["attention_mask"]], dim=0) # [2B, L]
         return embeds, attn_mask
 
@@ -411,7 +285,6 @@ class SphereDiffusion(nn.Module):
     @torch.no_grad()
     def text2panorama360(
         self, prompts, negative_prompts='',
-        prompt_2=None, negative_prompt_2=None,
         H=512, W=4096, num_inference_steps=50, guidance_scale=7.5,
         fov_deg=80.0, overlap=0.6, N_dirs=2600, tile_h=64, tile_w=64,
         use_cfg=True, outfolder='out',
@@ -430,9 +303,9 @@ class SphereDiffusion(nn.Module):
         if isinstance(negative_prompts, str): negative_prompts = [negative_prompts]
 
         # ----- spherical directions & global latent -----
-        dirs = generate_fibonacci_lattice(N_dirs).to(self.device, self.unet.dtype)  # [N,3]
-        C = self.unet.config.in_channels if hasattr(self.unet, "config") else self.unet.in_channels
-        feats = torch.randn(N_dirs, C, device=self.device, dtype=self.unet.dtype)   # [N, C]
+        dirs = generate_fibonacci_lattice(N_dirs).to(self.device, self.transformer.dtype)  # [N,3]
+        C = self.transformer.config.in_channels if hasattr(self.transformer, "config") else self.transformer.in_channels
+        feats = torch.randn(N_dirs, C, device=self.device, dtype=self.transformer.dtype)   # [N, C]
 
         # ----- tiles -----
         tiles = spherical_to_perspective_tiles(dirs=dirs, H=tile_h, W=tile_w, fov_deg=fov_deg, overlap=overlap)
@@ -448,29 +321,15 @@ class SphereDiffusion(nn.Module):
                 embeds, attn = self.get_text_embeds_sana(prompts, negative_prompts)
                 return dict(
                     kind='sana',
-                    embeds=embeds.to(self.unet.dtype).to(self.device),
+                    embeds=embeds.to(self.transformer.dtype).to(self.device),
                     attn=attn
                 )
-            elif self.rf_version == 'xl':
-                pe, pooled, time_ids = self.get_text_embeds_xl(prompts, negative_prompts)
-                return dict(
-                    kind='xl',
-                    prompt_embeds=pe.to(self.unet.dtype).to(self.device),
-                    pooled=pooled.to(self.unet.dtype).to(self.device),
-                    time_ids=time_ids.to(self.unet.dtype).to(self.device)
-                )
-            elif self.rf_version == '3.5':
+            else:  # self.rf_version == '3.5':
                 pe, pooled = self.get_text_embeds_sd35(prompts, negative_prompts)
                 return dict(
                     kind='sd35',
-                    prompt_embeds=pe.to(self.unet.dtype).to(self.device),
-                    pooled=pooled.to(self.unet.dtype).to(self.device)
-                )
-            else:  # 1.5 / 2.0 / 2.1
-                embeds = self.get_text_embeds(prompts, negative_prompts)
-                return dict(
-                    kind='sd',
-                    embeds=embeds.to(self.unet.dtype).to(self.device)
+                    prompt_embeds=pe.to(self.transformer.dtype).to(self.device),
+                    pooled=pooled.to(self.transformer.dtype).to(self.device)
                 )
 
         text_cond = _prepare_text_cond()
@@ -486,10 +345,6 @@ class SphereDiffusion(nn.Module):
                     # pooled_projections=dict(text_embeds=text_cond['pooled'])
                     pooled_projections=text_cond['pooled']
                 )
-            elif text_cond['kind'] == 'xl':
-                return dict(encoder_hidden_states=text_cond['prompt_embeds'],
-                            added_cond_kwargs=dict(text_embeds=text_cond['pooled'],
-                                                time_ids=text_cond['time_ids']))
             else:
                 return dict(encoder_hidden_states=text_cond['embeds'])
 
@@ -497,23 +352,17 @@ class SphereDiffusion(nn.Module):
             if self.rf_version =='SANA':
                 lin = self.scheduler.scale_model_input(latent_in, t_scalar)
                 t_in = make_timestep_1d(t_scalar, latent_in.shape[0], self.device, float_for_dit=True)
-                out = self.unet(hidden_states=lin, timestep=t_in, **cond_kwargs, return_dict=True).sample
-            elif self.rf_version == '3.5':
+                out = self.transformer(hidden_states=lin, timestep=t_in, **cond_kwargs, return_dict=True).sample
+            else:  # self.rf_version == '3.5':
                 lin = self.scheduler.scale_model_input(latent_in, t_scalar) \
                     if hasattr(self.scheduler, "scale_model_input") else latent_in
                 t_in = make_timestep_1d(t_scalar, latent_in.shape[0], self.device, float_for_dit=True)
-                out = self.unet(
+                out = self.transformer(
                     hidden_states=lin,
                     timestep=t_in,
                     **cond_kwargs,             # encoder_hidden_states + pooled_projections
                     return_dict=True
                 ).sample
-            elif self.rf_version == 'xl':
-                t_model = self.scheduler.timesteps[step_idx]
-                lin = self.scheduler.scale_model_input(latent_in, t_model)
-                out = self.unet(sample=lin, timestep=t_model, **cond_kwargs, return_dict=True).sample
-            else:
-                out = self.unet(sample=latent_in, timestep=t_scalar, **cond_kwargs, return_dict=True).sample
             return out
 
         def _apply_cfg(noise_2B):
@@ -525,7 +374,7 @@ class SphereDiffusion(nn.Module):
             used_idx = tile["used_idx"].long()
             lin = tile["lin_coords"].long()
             Ht, Wt = tile["H"], tile["W"]
-            flat = torch.zeros(Ht * Wt, C, device=self.device, dtype=self.unet.dtype)
+            flat = torch.zeros(Ht * Wt, C, device=self.device, dtype=self.transformer.dtype)
             flat.index_copy_(0, lin, feats_global[used_idx])
             return flat.view(Ht, Wt, C).permute(2,0,1).unsqueeze(0)  # [1,C,Ht,Wt]
 
@@ -547,17 +396,12 @@ class SphereDiffusion(nn.Module):
             sh = float(getattr(self.vae.config, "shift_factor", 0.0))
 
             # ---- 모델별 디코드 정책
-            if self.rf_version == 'xl':
-                autocast_enabled = False
-                vae_in_dtype = torch.float32
-                lat = (xprev / 0.13025).to(torch.float32) + 0.0
-
-            elif self.rf_version == 'SANA':
+            if self.rf_version == 'SANA':
                 autocast_enabled = True
                 vae_in_dtype = torch.bfloat16
                 lat = (xprev / 0.41407).to(torch.float32) + 0.0
 
-            elif self.rf_version == '3.5':
+            else:  # self.rf_version == '3.5'
                 force_upcast = bool(getattr(self.vae.config, "force_upcast", False))
                 if force_upcast:
                     self.vae.to(dtype=torch.float32)
@@ -567,11 +411,7 @@ class SphereDiffusion(nn.Module):
                     vae_in_dtype = getattr(self.vae, "dtype", torch.bfloat16)
                     autocast_enabled = (vae_in_dtype in (torch.bfloat16, torch.float16))
 
-                lat = (xprev.to(torch.float32) / sf) + sh  # 스케일/시프트는 fp32에서
-            else:
-                autocast_enabled = False
-                vae_in_dtype = torch.float32
-                lat = (xprev / 0.18215).to(torch.float32) + 0.0
+                lat = (xprev.to(torch.float32) / sf) + sh
 
             lat = lat.to(device=self.vae.device, dtype=vae_in_dtype)
 
@@ -586,12 +426,7 @@ class SphereDiffusion(nn.Module):
             T.ToPILImage()(tile_img.cpu()).save(os.path.join(outfolder, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
 
         def _decode_erp_from_feats(feats_spherical):
-            if self.rf_version == 'xl':
-                erp = stitch_final_erp_from_tiles_xl(
-                    feats_spherical=feats_spherical, dirs=dirs, tiles=tiles, vae=self.vae,
-                    scale=1/0.13025, pano_H=H, pano_W=W, fov_deg=fov_deg
-                )
-            elif self.rf_version == '3.5':
+            if self.rf_version == '3.5':
                 erp = stitch_final_erp_from_tiles_35(
                     feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
                     pano_H=H, pano_W=W, fov_deg=fov_deg
@@ -599,7 +434,7 @@ class SphereDiffusion(nn.Module):
             else:
                 erp = stitch_final_erp_from_tiles(
                     feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
-                    scale=(1/0.41407 if self.rf_version=='SANA' else 1/0.18215),
+                    scale=1/0.41407,
                     pano_H=H, pano_W=W, fov_deg=fov_deg, rf_version=self.rf_version
                 )
             return erp  # [3,H,W] in [0,1]
@@ -650,7 +485,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--prompt', type=str, default='a photo of the dolomites')
     parser.add_argument('--negative', type=str, default='')
-    parser.add_argument('--rf_version', type=str, default='2.0', choices=['1.5', '2.0', '2.1','3.5', 'xl', 'SANA'],
+    parser.add_argument('--rf_version', type=str, default='3.5', choices=['3.5', 'SANA'],
                         help="Reference diffusion version")
     parser.add_argument('--H', type=int, default=512, help="Panorama height")
     parser.add_argument('--W', type=int, default=4096, help="Panorama width")
@@ -676,7 +511,6 @@ if __name__ == '__main__':
     sd = SphereDiffusion(device, opt.rf_version)
 
     img = sd.text2panorama360(opt.prompt, opt.negative,
-                              opt.prompt, opt.negative, # SDXL
                               opt.H, opt.W, 
                               opt.steps, opt.guidance_scale, 
                               opt.fov_deg, opt.overlap, opt.N_dirs, opt.Hlat, opt.Wlat, 
