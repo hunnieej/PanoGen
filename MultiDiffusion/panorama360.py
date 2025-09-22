@@ -15,15 +15,18 @@ from diffusers import (AutoencoderKL,
 
 # functions : Sphere - S^2 - ERP 관련 함수 넣기
 # utils : 그 외 다른 함수들 넣기
-from projection_DiT import (generate_fibonacci_lattice, 
-                   spherical_to_perspective_tiles_tokenized,
+from projection360 import (generate_fibonacci_lattice, 
+                   spherical_to_perspective_tiles,
                    fuse_perspective_to_spherical,
-                   stitch_final_erp_from_tiles_SANA,
-                   stitch_final_erp_from_tiles_35
+                   log_overlap_between_views,
+                   compute_and_save_overlap_matrix,
+                   fuse_persp_to_sph_with_raw,
+                   build_membership_map
                    )
+from projection_erp import (stitch_final_erp_from_tiles)
 
 from utils import (make_timestep_1d,
-                   save_tiles_on_panorama,
+                   save_tiles_on_panorama
                    )
 
 # suppress partial model loading warning
@@ -32,8 +35,9 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 import torch.nn.functional as F
-import math, os, inspect, argparse, ast, copy
+import math, os, argparse, ast, copy, yaml, csv, json
 from tqdm import tqdm
+import numpy as np
 
 ########################################################################################################
 
@@ -102,7 +106,6 @@ class SphereDiffusion(nn.Module):
         elif len(negative_prompt) != B:
             raise ValueError(f"negative_prompt length ({len(negative_prompt)}) must match prompt length ({B})")
 
-        # 디바이스 및 dtype 설정
         if device is None:
             device = self.device
         if dtype is None:
@@ -111,7 +114,6 @@ class SphereDiffusion(nn.Module):
         tok1, tok2, tok3 = self.tokenizer_1, self.tokenizer_2, self.tokenizer_3
         te1, te2, te3 = self.text_encoder_1, self.text_encoder_2, self.text_encoder_3
 
-        # CLIP 토크나이저 설정
         for tok in (tok1, tok2):
             if tok.pad_token is None:
                 tok.pad_token = getattr(tok, "eos_token", tok.unk_token)
@@ -122,11 +124,9 @@ class SphereDiffusion(nn.Module):
         d_t5 = te3.config.d_model #4096
         joint_dim = getattr(self.transformer.config, "joint_attention_dim", d_t5) #4096
 
-        print(f"텍스트 인코더 차원: CLIP1={d_clip1}, CLIP2={d_clip2}, T5={d_t5}, Joint={joint_dim}")
+        print(f"Text Encoder dim: CLIP1={d_clip1}, CLIP2={d_clip2}, T5={d_t5}, Joint={joint_dim}")
 
-        # ---------- 인코딩 함수들 ----------
         def encode_clip(tokenizer, encoder, texts, skip_layers=None):
-            """CLIP 텍스트 인코딩"""
             try:
                 inputs = tokenizer(
                     texts, 
@@ -141,30 +141,26 @@ class SphereDiffusion(nn.Module):
                         input_ids=inputs["input_ids"].to(device), 
                         output_hidden_states=True
                     )
-                
-                # 레이어 선택 (CLIP skip 적용)
+
                 if skip_layers is None:
-                    hidden_states = outputs.hidden_states[-2]  # 마지막에서 두번째 레이어
+                    hidden_states = outputs.hidden_states[-2]
                 else:
                     layer_idx = -(skip_layers + 2)
                     hidden_states = outputs.hidden_states[layer_idx]
-                
-                # Pooled output 가져오기
+
                 if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
                     pooled = outputs.pooler_output
                 elif hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
                     pooled = outputs.text_embeds
                 else:
-                    # CLS 토큰 사용
                     pooled = hidden_states[:, 0]
                     
                 return hidden_states.to(dtype), pooled.to(dtype)
                 
             except Exception as e:
-                raise RuntimeError(f"CLIP 인코딩 실패: {e}")
+                raise RuntimeError(f"CLIP Encoding Failed: {e}")
 
         def encode_t5(tokenizer, encoder, texts):
-            """T5 텍스트 인코딩"""
             try:
                 inputs = tokenizer(
                     texts, 
@@ -181,7 +177,7 @@ class SphereDiffusion(nn.Module):
                 return outputs.last_hidden_state.to(dtype)
                 
             except Exception as e:
-                raise RuntimeError(f"T5 인코딩 실패: {e}")
+                raise RuntimeError(f"T5 Encoding Failed : {e}")
 
         def project_to_joint_dim(embeddings, source_dim, target_dim, name):
             if source_dim == target_dim:
@@ -190,22 +186,14 @@ class SphereDiffusion(nn.Module):
                 pad_size = target_dim - source_dim
                 return torch.nn.functional.pad(embeddings, (0, pad_size))
 
-        # ---------- 실제 인코딩 수행 ----------
-        print("텍스트 인코딩 시작...")
-        
-        # Conditional 임베딩
         clip1_cond, pooled1_cond = encode_clip(tok1, te1, prompt, clip_skip)
         clip2_cond, pooled2_cond = encode_clip(tok2, te2, prompt, clip_skip)
         t5_cond = encode_t5(tok3, te3, prompt)
         
-        # Unconditional 임베딩
         clip1_uncond, pooled1_uncond = encode_clip(tok1, te1, negative_prompt, clip_skip)
         clip2_uncond, pooled2_uncond = encode_clip(tok2, te2, negative_prompt, clip_skip)
         t5_uncond = encode_t5(tok3, te3, negative_prompt)
 
-        # ---------- Joint dimension으로 투영 ----------
-        print("차원 투영 중...")
-        
         clip1_cond = project_to_joint_dim(clip1_cond, d_clip1, joint_dim, "clip1")
         clip2_cond = project_to_joint_dim(clip2_cond, d_clip2, joint_dim, "clip2")
         t5_cond = project_to_joint_dim(t5_cond, d_t5, joint_dim, "t5")
@@ -214,24 +202,19 @@ class SphereDiffusion(nn.Module):
         clip2_uncond = project_to_joint_dim(clip2_uncond, d_clip2, joint_dim, "clip2")
         t5_uncond = project_to_joint_dim(t5_uncond, d_t5, joint_dim, "t5")
 
-        # ---------- 시퀀스 연결 ----------
-        # SD3.5는 [CLIP-L, CLIP-G, T5] 순서로 연결
         cond_embeds = torch.cat([clip1_cond, clip2_cond, t5_cond], dim=1)
         uncond_embeds = torch.cat([clip1_uncond, clip2_uncond, t5_uncond], dim=1)
-        
-        # [uncond, cond] 순서로 배치
+
         prompt_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
 
-        # ---------- Pooled projections ----------
         pooled_cond = torch.cat([pooled1_cond, pooled2_cond], dim=-1)
         pooled_uncond = torch.cat([pooled1_uncond, pooled2_uncond], dim=-1)
         pooled_proj = torch.cat([pooled_uncond, pooled_cond], dim=0)
 
-        # 최종 디바이스/dtype 확인
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_proj = pooled_proj.to(device=device, dtype=dtype)
         
-        print(f"완료 - prompt_embeds: {prompt_embeds.shape}, pooled_proj: {pooled_proj.shape}")
+        print(f"Done - prompt_embeds: {prompt_embeds.shape}, pooled_proj: {pooled_proj.shape}")
         
         return prompt_embeds, pooled_proj
 
@@ -308,14 +291,20 @@ class SphereDiffusion(nn.Module):
         feats = torch.randn(N_dirs, C, device=self.device, dtype=self.transformer.dtype)   # [N, C]
 
         # ----- tiles -----
-        # tiles = spherical_to_perspective_tiles_tokenized(dirs=dirs, 
-        #                                                  Hp=tile_h, Wp=tile_w, 
-        #                                                  fov_deg=fov_deg)
-        tiles = spherical_to_perspective_tiles_tokenized(dirs=dirs, 
-                                                         Hp=tile_h, Wp=tile_w, 
-                                                         fov_deg=fov_deg)
-
+        tiles = spherical_to_perspective_tiles(dirs=dirs, 
+                                               Hp=tile_h, Wp=tile_w, 
+                                               fov_deg=fov_deg)
+        log_path = os.path.join(outfolder, "tile_info")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        tile_info_path = os.path.join(log_path, "tile_info.txt")
+        tile_csv_path = os.path.join(log_path, "tile_info.csv")
+        os.makedirs(os.path.dirname(tile_info_path), exist_ok=True)
+        os.makedirs(os.path.dirname(tile_csv_path), exist_ok=True)
+        log_overlap_between_views(tiles, log_path=tile_info_path)
+        compute_and_save_overlap_matrix(tiles, log_path=tile_csv_path, mode="count")
+        
         tau = 0.6 * math.tan(math.radians(fov_deg) * 0.5)  # distortion-aware weight
+        # feats = init_global_from_tiles_randn(tiles, C, dirs, tau, self.transformer.dtype, self.device)
         if save_tile_panorama:
             save_tiles_on_panorama(tiles, pano_H=H, pano_W=W,
                                     mode="outline", step=6,
@@ -376,6 +365,13 @@ class SphereDiffusion(nn.Module):
             n_u, n_c = noise_2B.chunk(2, dim=0)
             return n_u + guidance_scale * (n_c - n_u)
 
+        # TODO : Tile 생성(결국 sampling) 이 부분이 명시적으로 해결되어야함
+        '''
+        현재 문제점(250916)
+        - Spherical latent 1개가 1개의 latent space grid로 대응되지 않는 문제 발생
+        - E.g. 1024개의 spherical latent가 sampling 되었지만, pixel 결과는 latent가 부족한 상황의 결과 발생
+        - 따라서 1개의 spherical latent가 mapping 되면, perspective latent space 상에서도 1x1-latent를 차지하는 것으로 설계 수정
+        '''
         def _gather_tile(feats_global, tile, C):
             used_idx = tile["used_idx"].long()
             lin      = tile["lin_coords"].long()
@@ -424,22 +420,16 @@ class SphereDiffusion(nn.Module):
                     dec = self.vae.decode(lat).sample  # [-1,1]
             else:
                 dec = self.vae.decode(lat).sample
-
+ 
             tile_img = (dec[0].float() / 2 + 0.5).clamp(0, 1)
-            T.ToPILImage()(tile_img.cpu()).save(os.path.join(outfolder, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
+            tile_path = os.path.join(outfolder, "tile_intermediate")
+            os.makedirs(tile_path, exist_ok=True)
+            T.ToPILImage()(tile_img.cpu()).save(os.path.join(tile_path, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
 
         def _decode_erp_from_feats(feats_spherical):
-            if self.rf_version == '3.5':
-                erp = stitch_final_erp_from_tiles_35(
-                    feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
-                    pano_H=H, pano_W=W, fov_deg=fov_deg
-                )
-            else:
-                erp = stitch_final_erp_from_tiles_SANA(
-                    feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
-                    scale=1/0.41407,
-                    pano_H=H, pano_W=W, fov_deg=fov_deg
-                )
+            erp = stitch_final_erp_from_tiles(
+                feats_spherical=feats_spherical, tiles=tiles, vae=self.vae,
+                pano_H=H, pano_W=W, fov_deg=fov_deg, rf_version=self.rf_version)
             return erp  # [3,H,W] in [0,1]
 
         def _save_erp_if_needed(feats_spherical, step_idx):
@@ -448,37 +438,119 @@ class SphereDiffusion(nn.Module):
             erp_mid = _decode_erp_from_feats(feats_spherical)
             T.ToPILImage()(erp_mid.cpu()).save(os.path.join(outfolder, f"step_{step_idx:03d}.png"))
 
-        # ===== diffusion loop =====
+        def _one_step_with_tmp_scheduler(model_output, sample, step_idx):
+            ts_full = self.scheduler.timesteps
+            k0 = int(step_idx)
+            if k0 >= len(ts_full) - 1:
+                return sample
+            k1 = k0 + 1
+
+            tmp = type(self.scheduler).from_config(self.scheduler.config)
+            tmp.set_timesteps(self.num_inference_steps)
+
+            try:
+                tmp.timesteps = ts_full.new_tensor([ts_full[k0], ts_full[k1]])
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self.scheduler, "sigmas") and hasattr(tmp, "sigmas"):
+                    tmp.sigmas = self.scheduler.sigmas[k0:k1+1]
+            except Exception:
+                pass
+
+            step_res = tmp.step(
+                model_output=model_output,
+                timestep=tmp.timesteps[0],
+                sample=sample,
+            )
+            return step_res.prev_sample
+
+        log_dir = os.path.join(outfolder, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        tile_count_path = os.path.join(log_dir, "tile_assigned_counts.csv")
+        membership_path = os.path.join(log_dir, "membership.json")
+        values_path     = os.path.join(log_dir, "values.csv")
+
+        N_dirs = feats.shape[0]  # [N_dirs, C]
+        membership = build_membership_map(tiles, N_dirs)
+        with open(membership_path, "w") as f:
+            json.dump({"N_dirs": N_dirs, "membership": membership}, f)
+
+        with open(values_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["step","k","view","init_raw_norm","init_weighted_norm","global_weighted_norm"])
+
+        with open(tile_count_path, "w") as f:
+            f.write("tile_idx,num_used,n_lin_coords,n_used_idx\n")
+            for t_i, tile in enumerate(tiles):
+                _, fused_w = fuse_perspective_to_spherical(
+                    tile_feats=torch.zeros(1, C, tile["H"], tile["W"], device=self.device),  # dummy
+                    tiles_info=[tile],
+                    sphere_dirs=dirs,
+                    tau=tau
+                )
+                
+                num_used = int((fused_w > 1e-12).sum().item())  # 실제 기여한 latent 개수
+                f.write(f"{t_i},{num_used},{len(tile['lin_coords'].cpu().numpy().tolist())},{len(tile['used_idx'].cpu().numpy().tolist())}\n")
+
         self.scheduler.set_timesteps(num_inference_steps)
         total_steps = len(self.scheduler.timesteps)
         print(f"[INFO] Output folder ready: {outfolder}")
         if save_intermediate:
             print(f"[INFO] Will save {len(tiles)} tiles × {num_inference_steps} steps = {len(tiles)*num_inference_steps} tile images")
-        
-        with tqdm(total=total_steps, desc='Generating panorama') as pbar:
+
+        with tqdm(total=total_steps, desc='Generating panorama') as pbar, \
+            open(values_path, "a", newline="") as fv:
+            wcsv = csv.writer(fv)
+
             for step_idx, t_scalar in enumerate(self.scheduler.timesteps):
-                tile_eps_list = []
-                for tile_idx, tile in enumerate(tiles):
+                accum = torch.zeros_like(feats, dtype=torch.float32)            # [N_dirs,C]
+                wsum  = torch.zeros(feats.shape[0], 1, device=self.device, dtype=torch.float32)
+
+                init_raw_mean_per_view  = [torch.zeros_like(feats) for _ in tiles]
+                init_wavg_mean_per_view = [torch.zeros_like(feats) for _ in tiles]
+
+                for view_idx, tile in enumerate(tiles):
                     I = _gather_tile(feats, tile, C)
-                    latent_in = torch.cat([I, I], dim=0) if use_cfg else I
+                    latent_in  = torch.cat([I, I], dim=0) if use_cfg else I
                     cond_kwargs = _make_cond_kwargs(latent_in.shape[0])
-                    noise = _transformer_forward(latent_in, t_scalar, cond_kwargs)  # [B,C,Ht,Wt]
+                    eps_bchw = _transformer_forward(latent_in, t_scalar, cond_kwargs)
+                    eps_tile = _apply_cfg(eps_bchw) if use_cfg else eps_bchw
+                    eps_tile = eps_tile.squeeze(0)  # [C,Ht,Wt]
 
-                    eps_tile = _apply_cfg(noise) if use_cfg else noise                 # [1,C,Ht,Wt]
-                    tile_eps_list.append(eps_tile.squeeze(0))                          # [C,Ht,Wt]
-                    _save_tile_preview_if_needed(eps_tile.squeeze(0), I, step_idx, tile_idx)
+                    tile_prev = _one_step_with_tmp_scheduler(
+                        model_output=eps_tile.unsqueeze(0),
+                        sample=I,
+                        step_idx=step_idx
+                    ).squeeze(0)  # [C,H,W]
 
-                eps_tiles = torch.stack(tile_eps_list, dim=0)  # [T,C,Ht,Wt]
-                fused_eps = fuse_perspective_to_spherical(
-                    tile_feats=eps_tiles, tiles_info=tiles, 
-                    sphere_dirs=dirs, tau=tau
-                )  # [N_dirs, C]
-                feats = self.scheduler.step(model_output=fused_eps, timestep=t_scalar, sample=feats).prev_sample
+                    acc_w, w_i, acc_raw, cnt_raw = fuse_persp_to_sph_with_raw(
+                        tile_prev.unsqueeze(0), tile, sphere_dirs=dirs,tau=tau
+                    )
+                    accum += acc_w
+                    wsum  += w_i
+                    raw_mean_i  = acc_raw / torch.clamp_min(cnt_raw, 1e-6)
+                    wavg_mean_i = acc_w  / torch.clamp_min(w_i,     1e-6)
+                    init_raw_mean_per_view[view_idx]  = raw_mean_i
+                    init_wavg_mean_per_view[view_idx] = wavg_mean_i
+
+                    _save_tile_preview_if_needed(eps_tile, I, step_idx, view_idx)
+                feats = (accum / torch.clamp_min(wsum, 1e-6)).to(self.transformer.dtype)  # [N_dirs,C]
+                global_norm = feats.norm(dim=1)  # [N_dirs]
+
+                if step_idx % 10 == 0 or step_idx == total_steps:
+                    for k, views in enumerate(membership):
+                        if not views:
+                            continue
+                        gk = float(global_norm[k].item())
+                        for vi in views:
+                            rnorm = float(init_raw_mean_per_view[vi][k].norm().item())
+                            wnorm = float(init_wavg_mean_per_view[vi][k].norm().item())
+                            wcsv.writerow([step_idx, k, vi, rnorm, wnorm, gk])
                 _save_erp_if_needed(feats, step_idx)
-
                 pbar.update(1)
 
-        # ===== final decode =====
         erp_img = _decode_erp_from_feats(feats)
         return T.ToPILImage()(erp_img.cpu())
     
@@ -506,6 +578,14 @@ if __name__ == '__main__':
     parser.add_argument('--save_tile_intermediate', type=ast.literal_eval, choices = [True, False], default=False, help='Save intermediate tile images for each step')
     parser.add_argument('--save_tile_panorama', type=ast.literal_eval, choices = [True, False], default=False, help='Save intermediate tile images in panorama layout')
     opt = parser.parse_args()
+
+    # Save argparse arguments to yaml file in output folder
+    args_dict = vars(opt)
+    os.makedirs(opt.outfolder, exist_ok=True)
+    yaml_filename = os.path.join(opt.outfolder, f"{os.path.basename(opt.outfolder)}.yaml")
+    with open(yaml_filename, 'w') as f:
+        yaml.dump(args_dict, f)
+    print(f"[INFO] Saved experiment config to: {yaml_filename}")
 
     seed_everything(opt.seed)
 

@@ -135,6 +135,7 @@ class MultiDiffusion(nn.Module):
                     count[:, :, h_start:h_end, w_start:w_end] += 1
 
                 # take the MultiDiffusion step
+                # NOTE : 논문에서 언급하는 weighted average
                 latent = torch.where(count > 0, value / count, value)
 
         # Img latents -> imgs
