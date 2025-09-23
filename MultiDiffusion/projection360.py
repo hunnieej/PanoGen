@@ -119,7 +119,6 @@ def spiral_coords_even(H: int, W: int, *, return_linear: bool = False, device=No
         # N x N rectangle Generation
         top, left  = mid - i,     mid - i
         bot, right = mid + i - 1, mid + i - 1
-
         for c in range(left, right + 1):
             out_rc.append((top, c))
         for r in range(top + 1, bot):
@@ -138,12 +137,21 @@ def spiral_coords_even(H: int, W: int, *, return_linear: bool = False, device=No
 
 # --------- Dynamic Latent Sampling ----------
 @torch.no_grad()
-def dynamic_sampling_to_tokens(uv: torch.Tensor, K: torch.Tensor, Hp: int, Wp: int):
+def dynamic_sampling(uv: torch.Tensor, K: torch.Tensor, Hp: int, Wp: int):
     device = uv.device
     fx, fy = K[0,0], K[1,1]; cx, cy = K[0,2], K[1,2]
+
+    # camera-normalized
     u_n = (uv[:,0] - cx) / fx
     v_n = (uv[:,1] - cy) / fy
-    r2  = u_n**2 + v_n**2
+
+    # unit-square 좌표 ([-1,1]^2) — 경계가 정확히 ±1
+    tan_hfov = (Wp / (2.0 * fx)).item()
+    u_hat = u_n / tan_hfov
+    v_hat = v_n / tan_hfov
+
+    # 중심 우선(반지름^2) 정렬 — FOV/해상도 불변
+    r2  = u_hat**2 + v_hat**2
     order = torch.argsort(r2)
 
     rc = spiral_coords_even(Hp, Wp).to(device)
@@ -153,6 +161,7 @@ def dynamic_sampling_to_tokens(uv: torch.Tensor, K: torch.Tensor, Hp: int, Wp: i
     rc_sel = rc[:Ksel]
     lin = rc_sel[:,0] * Wp + rc_sel[:,1]
     return Hp, Wp, pick, lin, rc_sel
+
 # ------------------------------------------------------------------------
 @torch.no_grad()
 def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tensor,
@@ -162,7 +171,7 @@ def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tenso
     K_f    = K.to(torch.float32)
 
     # Camera 좌표계: X_cam = X_world @ R.T
-    X = dirs_f @ R_f.T                      # [N,3], f32
+    X = dirs_f @ R_f.T
     vis = X[:,2] > z_eps
     vis_idx = torch.nonzero(vis, as_tuple=False).squeeze(1)
     Xv = X[vis]
@@ -174,10 +183,8 @@ def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tenso
     v  = fy * yz + cy
     uv = torch.stack([u, v], dim=-1)
 
-    u_n = xz                                 # = (u-cx)/fx
-    v_n = yz                                 # = (v-cy)/fy
     tan_hfov = (Wp / (2.0 * fx)).item()
-    r2 = u_n**2 + v_n**2
+    r2 = xz**2 + yz**2
     in_fov = r2 <= (tan_hfov**2)
 
     if in_fov.any():
@@ -188,10 +195,21 @@ def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tenso
         uv = uv[:0]
         vis_idx = vis_idx[:0]
 
-    Hp, Wp, pick_in_vis, lin_coords_tok, rc_coords_tok = dynamic_sampling_to_tokens(uv, K_f, Hp, Wp)
+    M = uv.shape[0]
+    if M > 0:
+        u_n = (uv[:,0] - cx) / fx
+        v_n = (uv[:,1] - cy) / fy
+        u_hat = u_n / tan_hfov
+        v_hat = v_n / tan_hfov
+        print("[OK][project_dynamic_sampling]",
+            f"u:[{u_hat.min().item():.3f},{u_hat.max().item():.3f}] ",
+            f"v:[{v_hat.min().item():.3f},{v_hat.max().item():.3f}] ",
+            f"M={M}")
+    else:
+        print("[OK][project_dynamic_sampling] empty view after FoV filter, M=0")
+    Hp, Wp, pick_in_vis, lin_coords_tok, rc_coords_tok = dynamic_sampling(uv, K_f, Hp, Wp)
     used_idx = vis_idx[pick_in_vis]
-
-    return Hp, Wp, used_idx, lin_coords_tok, rc_coords_tok, uv[pick_in_vis]  # uv는 f32 유지
+    return Hp, Wp, used_idx, lin_coords_tok, rc_coords_tok, uv[pick_in_vis]
 
 # --------- 89-view 타일 생성 ----------
 def spherical_to_perspective_tiles(
@@ -215,11 +233,18 @@ def spherical_to_perspective_tiles(
     for yaw_deg, pitch_deg in zip(yaws, pitches):
         yaw = math.radians(yaw_deg); pitch = math.radians(pitch_deg)
 
-        # (+Z forward)
+        # (+Z forward = Y-up)
+        # look_dir = torch.tensor([
+        #     math.cos(pitch)*math.sin(yaw),
+        #     math.sin(pitch),
+        #     math.cos(pitch)*math.cos(yaw)
+        # ], device=device, dtype=dtype)
+
+        # (+Y forward = Z-up)
         look_dir = torch.tensor([
+            math.cos(pitch)*math.cos(yaw),
             math.cos(pitch)*math.sin(yaw),
-            math.sin(pitch),
-            math.cos(pitch)*math.cos(yaw)
+            math.sin(pitch)
         ], device=device, dtype=dtype)
 
         R = make_extrinsic(look_dir)
@@ -227,6 +252,15 @@ def spherical_to_perspective_tiles(
         Hp_out, Wp_out, used_idx, lin_tok, rc_tok, uv_sel = project_dynamic_sampling(
             dirs, R, K, Hp, Wp
         )
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        if uv_sel.numel() > 0:
+            u_n = (uv_sel[:,0] - cx) / fx
+            v_n = (uv_sel[:,1] - cy) / fy
+            tan_hfov = (Wp_out / (2.0 * fx)).item()
+            uv_unit = torch.stack([u_n / tan_hfov, v_n / tan_hfov], dim=-1)
+        else:
+            uv_unit = uv_sel
+
         tiles.append({
             "yaw": yaw_deg, "pitch": pitch_deg,
             "R": R, "K": K,
@@ -234,7 +268,7 @@ def spherical_to_perspective_tiles(
             "used_idx": used_idx,
             "lin_coords": lin_tok,
             "rc_coords": rc_tok,
-            "uv_sel": uv_sel,
+            "uv_unit": uv_unit,
         })
     return tiles
 # ------------------------------------------------------------------------
@@ -327,15 +361,11 @@ def fuse_perspective_to_spherical(
         used_idx = tile['used_idx'].long()                        # [M]
         feat_sel = feat_flat.index_select(0, lin).to(torch.float32)  # [M,C]
 
-        uv = tile['uv_sel']
-        K  = tile['K'].to(uv.dtype)
-        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-        u_n = (uv[:, 0] - cx) / fx
-        v_n = (uv[:, 1] - cy) / fy
-        r   = torch.sqrt(u_n**2 + v_n**2)                     # [M]
-        # print("(yaw, pitch)", (tile["yaw"],tile["pitch"]), "uv range", uv.min().item(), uv.max().item(),
-        #           "r mean", r.mean().item(), "r max", r.max().item())
-        w = torch.exp(-r / max(tau, 1e-6)).unsqueeze(1).to(torch.float32)  # [M,1]
+        uv = tile['uv_unit']
+        u_hat = uv[:, 0]
+        v_hat = uv[:, 1]
+        r = torch.sqrt(u_hat**2 + v_hat**2)   # [0, sqrt(2)]
+        w = torch.exp(-r /tau).unsqueeze(1).to(torch.float32)
 
         # ---- accumulate ----
         accum.index_add_(0, used_idx, w * feat_sel)
