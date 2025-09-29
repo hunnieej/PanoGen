@@ -1,5 +1,3 @@
 .vscode/*
 /MultiDiffusion/outputs/*
-/vis/out/*
-/vis/out_views/*
-/vis/out_views_dynamic/*
+/vis/*
