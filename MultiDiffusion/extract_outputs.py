@@ -115,7 +115,7 @@ def create_tar_archive(source_dir, tar_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Extract panorama output images and create tar archive")
-    parser.add_argument("input_dir", help="Input directory containing generated images")
+    parser.add_argument("--input_dir", help="Input directory containing generated images")
     parser.add_argument("--output_dir", help="Output directory for extracted images (default: input_dir + '_extracted')")
     parser.add_argument("--last_num", type=int, default=49, help="Step number to extract (default: 49)")
     parser.add_argument("--max_tile_idx", type=int, help="Maximum tile index to extract (default: auto-detect)")

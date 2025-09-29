@@ -1,6 +1,7 @@
 import torch
 import math
 import csv
+import torch.nn.functional as F
 
 ########################################################################################################
 # NOTE : Sphere - S^2 - ERP구현
@@ -45,27 +46,46 @@ def make_intrinsic(H, W, fov_deg, device=None, dtype=torch.float32):
 
 # NOTE : Extrinsic matrix R Generation (R_cw)
 # World 좌표계에서 Camera 좌표계로 변환 : X_cam = R.T @ X_world
-def make_extrinsic(look_dir: torch.Tensor, yaw_deg: float = None, eps: float = 1e-6):
-    z = torch.nn.functional.normalize(look_dir, dim=0)
-    if yaw_deg is not None:
-        yaw = math.radians(yaw_deg)
-        up_hint = torch.tensor([math.sin(yaw), 0.0, math.cos(yaw)], device=z.device, dtype=z.dtype)
-    else:
-        up_hint = torch.tensor([0., 1., 0.], device=z.device, dtype=z.dtype)
+def make_extrinsic(phi_deg: float, theta_deg: float, roll_deg: float = 0.0,
+                               device=None, dtype=torch.float32):
+    """
+    Y-forward, Z-up 카메라 기준.
+    월드→카메라 회전행렬 R을 오일러(Yaw=φ around Z)→(Pitch=θ around X)→(Roll=ρ around Y) 순서로 구성.
+    반환은 camera-basis (x_right, y_forward, z_up)를 column으로 쌓은 R_cw.
+    """
+    device = device or torch.device('cpu')
+    phi   = math.radians(phi_deg)    # yaw (around Z)
+    theta = math.radians(theta_deg)  # pitch (around X)
+    rho   = math.radians(roll_deg)   # roll (around Y)
 
-    if torch.abs(torch.dot(z, up_hint)) > 1.0 - eps:
-        tmp = torch.tensor([1., 0., 0.], device=z.device, dtype=z.dtype)
-        if torch.abs(torch.dot(z, tmp)) > 1.0 - eps:
-            tmp = torch.tensor([0., 1., 0.], device=z.device, dtype=z.dtype)
-        up_hint = torch.nn.functional.normalize(torch.linalg.cross(z, tmp), dim=0)
+    # 회전행렬: R = Rz(phi) @ Rx(theta) @ Ry(rho)
+    cz, sz = math.cos(phi),   math.sin(phi)
+    cx, sx = math.cos(theta), math.sin(theta)
+    cy, sy = math.cos(rho),   math.sin(rho)
 
-    x = torch.nn.functional.normalize(torch.linalg.cross(up_hint, z), dim=0)
-    y = torch.linalg.cross(z, x)
-    return torch.stack([x, y, z], dim=-1)
-    
+    Rz = torch.tensor([[ cz, -sz, 0.],
+                       [ sz,  cz, 0.],
+                       [0.,  0.,  1.]], device=device, dtype=dtype)
+    Rx = torch.tensor([[1.,  0.,  0.],
+                       [0.,  cx, -sx],
+                       [0.,  sx,  cx]], device=device, dtype=dtype)
+    Ry = torch.tensor([[ cy, 0.,  sy],
+                       [0.,  1.,  0.],
+                       [-sy, 0.,  cy]], device=device, dtype=dtype)
+
+    R = Rz @ Rx @ Ry
+
+    # 열벡터가 camera basis: x(right), y(forward), z(up)
+    x = torch.nn.functional.normalize(R[:,0], dim=0)
+    y = torch.nn.functional.normalize(R[:,1], dim=0)
+    z = torch.linalg.cross(x, y)
+    R_cw = torch.stack([x, y, z], dim=-1)
+    return R_cw
+
+
 def make_view_centers_89(): # SphereDiff 논문 세팅
-    yaws = []
-    pitches = []
+    phi = []
+    theta = []
     
     def ring(phi_deg, num_theta):
         return [(round((360.0/num_theta)*k, 6), phi_deg) for k in range(num_theta)]
@@ -81,10 +101,10 @@ def make_view_centers_89(): # SphereDiff 논문 세팅
     views += ring(+90.0, 4)
     views += ring(-90.0, 4)
 
-    yaws = [v[0] for v in views]
-    pitches = [v[1] for v in views]
+    phi = [v[0] for v in views] #longitudes
+    theta = [v[1] for v in views] # latitudes
 
-    return yaws, pitches
+    return phi, theta
 
 ####################################################################################################################
 # ------------------------------------------------------------------------
@@ -135,81 +155,126 @@ def spiral_coords_even(H: int, W: int, *, return_linear: bool = False, device=No
         return lin
     return rc
 
-# --------- Dynamic Latent Sampling ----------
+# --------- Dynamic Latent Sampling ---------
 @torch.no_grad()
 def dynamic_sampling(uv: torch.Tensor, K: torch.Tensor, Hp: int, Wp: int):
+    """
+    Center-first(링 우선)는 유지하되, 빈칸 없이 타일을 채우도록
+    '샘플(uv)'와 '격자(rc)'를 동일 규칙(링→방위각)으로 전역 정렬하고
+    앞에서부터 1:1로 매칭한다. (스파이럴 격자, 센터우선 유지)
+    """
     device = uv.device
-    fx, fy = K[0,0], K[1,1]; cx, cy = K[0,2], K[1,2]
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
 
     # camera-normalized
     u_n = (uv[:,0] - cx) / fx
     v_n = (uv[:,1] - cy) / fy
 
-    # unit-square 좌표 ([-1,1]^2) — 경계가 정확히 ±1
+    # unit-square [-1,1] 정규화
     tan_hfov = (Wp / (2.0 * fx)).item()
     u_hat = u_n / tan_hfov
     v_hat = v_n / tan_hfov
 
-    # 중심 우선(반지름^2) 정렬 — FOV/해상도 불변
-    r2  = u_hat**2 + v_hat**2
-    order = torch.argsort(r2)
+    # uv의 링/방위각
+    r  = torch.sqrt(torch.clamp(u_hat**2 + v_hat**2, min=0.0))
+    az = torch.atan2(v_hat, u_hat) % (2.0 * math.pi)
+    mid = Hp // 2
+    ring_uv = torch.clamp((torch.clamp(r, 0.0, 1.0) * mid).long(), 0, mid - 1)
 
-    rc = spiral_coords_even(Hp, Wp).to(device)
+    # 스파이럴 격자 전체
+    rc = spiral_coords_even(Hp, Wp).to(device)      # [H*W,2]
+    # 격자셀 중심 기준 방위각
+    cxg, cyg = mid - 0.5, mid - 0.5
+    dy = (rc[:,0].float() + 0.5) - cyg
+    dx = (rc[:,1].float() + 0.5) - cxg
+    az_rc = torch.atan2(dy, dx) % (2.0 * math.pi)
+
+    # 격자 링 인덱스: 스파이럴 정의 그대로
+    # (거리 대신 정수 링: 바깥으로 갈수록 링 번호 증가)
+    # 아래는 rc가 어느 링에 속하는지 직접 계산
+    # 중심 2x2가 ring=0, 그 바깥 사각 둘레가 ring=1, ...
+    ring_rc = torch.empty(rc.shape[0], dtype=torch.long, device=device)
+    m = mid
+    for i in range(m):
+        top, left  = m - i - 1, m - i - 1
+        bot, right = m + i,     m + i
+        # 사각 링 경계에 해당하는 좌표만 해당 링
+        on_top = (rc[:,0] == top) & (rc[:,1] >= left) & (rc[:,1] <= right)
+        on_bot = (rc[:,0] == bot) & (rc[:,1] >= left) & (rc[:,1] <= right)
+        on_lft = (rc[:,1] == left) & (rc[:,0] >  top) & (rc[:,0] <  bot)
+        on_rgt = (rc[:,1] == right) & (rc[:,0] >  top) & (rc[:,0] <  bot)
+        mask_i = on_top | on_bot | on_lft | on_rgt
+        ring_rc[mask_i] = i
+
+    # 전역 정렬 키 (링 → 방위각 → 안정화용 인덱스)
+    M = uv.shape[0]
+    base_uv = torch.arange(M, device=device).float()
+    key_uv  = ring_uv.float() * 1e6 + (az / (2.0 * math.pi)) * 1e3 + base_uv / (M + 1.0)
+    order_uv = torch.argsort(key_uv)
+
     Ntar = rc.shape[0]
-    Ksel = min(uv.shape[0], Ntar)
-    pick = order[:Ksel]
-    rc_sel = rc[:Ksel]
-    lin = rc_sel[:,0] * Wp + rc_sel[:,1]
+    base_rc = torch.arange(Ntar, device=device).float()
+    key_rc  = ring_rc.float() * 1e6 + (az_rc / (2.0 * math.pi)) * 1e3 + base_rc / (Ntar + 1.0)
+    order_rc = torch.argsort(key_rc)
+
+    # 선택 개수
+    Ksel = min(M, Ntar)
+    pick   = order_uv[:Ksel]                      # uv에서 뽑을 순서
+    rc_sel = rc[order_rc[:Ksel]]                  # 대응하는 스파이럴 격자 칸
+    lin    = rc_sel[:,0] * Wp + rc_sel[:,1]       # linear index
+
     return Hp, Wp, pick, lin, rc_sel
 
 # ------------------------------------------------------------------------
 @torch.no_grad()
 def project_dynamic_sampling(dirs: torch.Tensor, R: torch.Tensor, K: torch.Tensor,
-                                   Hp: int, Wp: int, z_eps: float = 1e-3):
+                             Hp: int, Wp: int, fov_deg: float = 80.0):
     dirs_f = dirs.to(torch.float32)
     R_f    = R.to(torch.float32)
     K_f    = K.to(torch.float32)
-
-    # Camera 좌표계: X_cam = X_world @ R.T
-    X = dirs_f @ R_f.T
-    vis = X[:,2] > z_eps
-    vis_idx = torch.nonzero(vis, as_tuple=False).squeeze(1)
-    Xv = X[vis]
-
+    X = dirs_f @ R_f.T  # [N,3]
     fx, fy, cx, cy = K_f[0,0], K_f[1,1], K_f[0,2], K_f[1,2]
-    xz = Xv[:,0] / Xv[:,2]
-    yz = Xv[:,1] / Xv[:,2]
-    u  = fx * xz + cx
-    v  = fy * yz + cy
+    
+    h = torch.atan(Wp / (2.0 * fx))
+
+    X = dirs_f @ R_f.T
+    Xn = X / X.norm(dim=1, keepdim=True).clamp_min(1e-8)  # 단위벡터
+    cos_half_fov = math.cos(0.5*math.radians(fov_deg))
+    in_view = (Xn[:,1] >= cos_half_fov)
+
+    vis_idx = torch.nonzero(in_view, as_tuple=False).squeeze(1)
+    if vis_idx.numel() == 0: #view 2개 문제 있음 (0,90) / (0,-90)
+        print("[OK][project_dynamic_sampling Y-forward] empty view after FoV filter, M=0")
+        uv = X.new_zeros((0, 2))
+        Hp_out, Wp_out, pick_in_vis, lin_coords_tok, rc_coords_tok = dynamic_sampling(uv, K_f, Hp, Wp)
+        used_idx = vis_idx  # empty
+        return Hp_out, Wp_out, used_idx, lin_coords_tok, rc_coords_tok, uv
+
+    Xv = X[vis_idx]
+    yv = Xv[:,1].clamp_min(1e-6)
+    xy = Xv[:,0] / yv
+    zy = Xv[:,2] / yv
+    u  = fx * xy + cx
+    v  = fy * zy + cy
     uv = torch.stack([u, v], dim=-1)
 
-    tan_hfov = (Wp / (2.0 * fx)).item()
-    r2 = xz**2 + yz**2
-    in_fov = r2 <= (tan_hfov**2)
-
-    if in_fov.any():
-        Xv = Xv[in_fov]
-        uv = uv[in_fov]
-        vis_idx = vis_idx[in_fov]
-    else:
-        uv = uv[:0]
-        vis_idx = vis_idx[:0]
-
-    M = uv.shape[0]
-    if M > 0:
+    tan_hfov = torch.tan(h).item()
+    if uv.numel() > 0:
         u_n = (uv[:,0] - cx) / fx
         v_n = (uv[:,1] - cy) / fy
         u_hat = u_n / tan_hfov
         v_hat = v_n / tan_hfov
-        print("[OK][project_dynamic_sampling]",
-            f"u:[{u_hat.min().item():.3f},{u_hat.max().item():.3f}] ",
-            f"v:[{v_hat.min().item():.3f},{v_hat.max().item():.3f}] ",
-            f"M={M}")
+        print("[OK][project_dynamic_sampling Y-forward]",
+              f"u:[{u_hat.min().item():.3f},{u_hat.max().item():.3f}] ",
+              f"v:[{v_hat.min().item():.3f},{v_hat.max().item():.3f}] ",
+              f"M={uv.shape[0]}")
     else:
-        print("[OK][project_dynamic_sampling] empty view after FoV filter, M=0")
-    Hp, Wp, pick_in_vis, lin_coords_tok, rc_coords_tok = dynamic_sampling(uv, K_f, Hp, Wp)
+        print("[OK][project_dynamic_sampling Y-forward] empty view after projection, M=0")
+
+    Hp_out, Wp_out, pick_in_vis, lin_coords_tok, rc_coords_tok = dynamic_sampling(uv, K_f, Hp, Wp)
     used_idx = vis_idx[pick_in_vis]
-    return Hp, Wp, used_idx, lin_coords_tok, rc_coords_tok, uv[pick_in_vis]
+    return Hp_out, Wp_out, used_idx, lin_coords_tok, rc_coords_tok, uv[pick_in_vis]
 
 # --------- 89-view 타일 생성 ----------
 def spherical_to_perspective_tiles(
@@ -217,40 +282,36 @@ def spherical_to_perspective_tiles(
     Hp: int = 32, Wp: int = 32,
     fov_deg: float = 80.0,
     *,
-    yaw_pitch_provider = None,
+    phi_theta_provider = None,
     device=None, dtype=None
 ):
     device = device or dirs.device
     dtype  = dtype  or dirs.dtype
     K  = make_intrinsic(Hp, Wp, fov_deg, device=device, dtype=dtype)
 
-    if yaw_pitch_provider is None:
-        yaws, pitches = make_view_centers_89()
+    if phi_theta_provider is None:
+        phi, theta = make_view_centers_89()
     else:
-        yaws, pitches = yaw_pitch_provider()
+        phi, theta = phi_theta_provider()
 
     tiles = []
-    for yaw_deg, pitch_deg in zip(yaws, pitches):
-        yaw = math.radians(yaw_deg); pitch = math.radians(pitch_deg)
-
-        # (+Z forward = Y-up)
-        # look_dir = torch.tensor([
-        #     math.cos(pitch)*math.sin(yaw),
-        #     math.sin(pitch),
-        #     math.cos(pitch)*math.cos(yaw)
-        # ], device=device, dtype=dtype)
+    for phi_deg, theta_deg in zip(phi, theta):
+        phi = math.radians(phi_deg); theta = math.radians(theta_deg)
 
         # (+Y forward = Z-up)
         look_dir = torch.tensor([
-            math.cos(pitch)*math.cos(yaw),
-            math.cos(pitch)*math.sin(yaw),
-            math.sin(pitch)
+            math.cos(theta)*math.cos(phi),
+            math.cos(theta)*math.sin(phi),
+            math.sin(theta)
         ], device=device, dtype=dtype)
 
-        R = make_extrinsic(look_dir)
+        R = make_extrinsic(phi_deg=float(phi_deg),
+                               theta_deg=float(theta_deg),
+                               roll_deg=0.0,
+                               device=device, dtype=dtype)
 
         Hp_out, Wp_out, used_idx, lin_tok, rc_tok, uv_sel = project_dynamic_sampling(
-            dirs, R, K, Hp, Wp
+            dirs, R, K, Hp, Wp, fov_deg
         )
         fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
         if uv_sel.numel() > 0:
@@ -262,16 +323,62 @@ def spherical_to_perspective_tiles(
             uv_unit = uv_sel
 
         tiles.append({
-            "yaw": yaw_deg, "pitch": pitch_deg,
+            "phi": phi_deg, "theta": theta_deg,
             "R": R, "K": K,
             "H": Hp_out, "W": Wp_out,
             "used_idx": used_idx,
             "lin_coords": lin_tok,
             "rc_coords": rc_tok,
             "uv_unit": uv_unit,
+            "center_dir": look_dir,
         })
     return tiles
+
+##########################################################################################################################
 # ------------------------------------------------------------------------
+# F^-1 : I -> S
+# ------------------------------------------------------------------------
+@torch.no_grad()
+def fuse_perspective_to_spherical(tile_feats, tiles_info, sphere_dirs, *, tau=0.5):
+    device = tile_feats.device
+    N_dirs, C = sphere_dirs.shape[0], tile_feats.shape[1]
+
+    accum = torch.zeros(N_dirs, C, device=device, dtype=torch.float32)
+    wsum  = torch.zeros(N_dirs, 1, device=device, dtype=torch.float32)
+    sdirs = sphere_dirs / (sphere_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+    tau = float(tau)
+    if not (tau > 0):
+        tau = 1e-6
+
+    for tile_idx, tile in enumerate(tiles_info):
+        feat_hw = tile_feats[tile_idx]                          # [C,Ht,Wt]
+        uid = tile['used_idx'].long()                           # [M]
+        lin = tile['lin_coords'].long()                         # [M]
+        if uid.numel() == 0:
+            continue
+        assert lin.numel() == uid.numel(), "lin/uid length mismatch"
+
+        perm = torch.argsort(lin)
+        lin  = lin[perm]; uid = uid[perm]
+        feat_flat = feat_hw.reshape(C, -1).permute(1, 0).contiguous().float()  # [Ht*Wt,C]
+        feat_sel  = feat_flat.index_select(0, lin)                              # [M,C])
+        d = sdirs.index_select(0, uid)                                         # [M,3]
+        c = tile['center_dir'].to(device).float()
+        c = c / (c.norm() + 1e-8)
+        dot = (d * c.unsqueeze(0)).sum(-1).clamp(-1.0, 1.0)                    # [M]
+        r   = torch.arccos(dot)                                                # [M]
+        w   = torch.exp(-r / tau).unsqueeze(1).to(torch.float32)               # [M,1]
+        accum.index_add_(0, uid, w * feat_sel)                                  # [N,C]
+        wsum.index_add_(0,  uid, w)                                             # [N,1]
+
+    return accum, wsum
+
+##########################################################################################################################
+# ------------------------------------------------------------------------
+# Logging Functions for Debugging
+# ------------------------------------------------------------------------
+@torch.no_grad()
 def log_overlap_between_views(tiles, log_path="overlap_log.txt"):
     num_views = len(tiles)
     overlaps = []
@@ -333,86 +440,4 @@ def compute_and_save_overlap_matrix(tiles, log_path="overlap_matrix.csv",
     
     print(f"Overlap matrix saved to {log_path}")
     return matrix
-
-##########################################################################################################################
-# ------------------------------------------------------------------------
-# F^-1 : I -> S
-# ----------------------------------------------------------------------
-@torch.no_grad()
-def fuse_perspective_to_spherical(
-    tile_feats: torch.Tensor,    # [N_tiles, C, Ht, Wt]
-    tiles_info: list,            # 각 dict: 'used_idx','lin_coords','uv_sel','K','H','W'
-    sphere_dirs: torch.Tensor,   # [N_dirs, 3] (실제로는 index 크기만 사용)
-    *,
-    tau: float = 0.5,
-):
-    device = tile_feats.device
-    N_dirs = sphere_dirs.shape[0]
-    C = tile_feats.shape[1]
-
-    accum = torch.zeros(N_dirs, C, device=device, dtype=torch.float32)
-    wsum  = torch.zeros(N_dirs, 1, device=device, dtype=torch.float32)
-
-    for tile_idx, tile in enumerate(tiles_info):
-        feat_hw = tile_feats[tile_idx]                            # [C,Ht,Wt]
-        feat_flat = feat_hw.reshape(C, -1).permute(1, 0)          # [Ht*Wt, C]
-
-        lin = tile['lin_coords'].long()                           # [M]
-        used_idx = tile['used_idx'].long()                        # [M]
-        feat_sel = feat_flat.index_select(0, lin).to(torch.float32)  # [M,C]
-
-        uv = tile['uv_unit']
-        u_hat = uv[:, 0]
-        v_hat = uv[:, 1]
-        r = torch.sqrt(u_hat**2 + v_hat**2)   # [0, sqrt(2)]
-        w = torch.exp(-r /tau).unsqueeze(1).to(torch.float32)
-
-        # ---- accumulate ----
-        accum.index_add_(0, used_idx, w * feat_sel)
-        wsum.index_add_(0,  used_idx, w)
-
-    return accum, wsum
-
-@torch.no_grad()
-def fuse_persp_to_sph_with_raw(
-    tile_feats: torch.Tensor,   # [1,C,Ht,Wt] (단일 view의 타일 묶음이면 리스트로 루프 돌리기)
-    tile: dict,                 # 단일 타일(dict): 'used_idx','lin_coords','uv_sel','K','H','W'
-    sphere_dirs: torch.Tensor,
-    tau: float = 0.5
-):
-    # --- 기존 weighted ---
-    acc_w, wsum = fuse_perspective_to_spherical(
-        tile_feats=tile_feats, tiles_info=[tile], sphere_dirs=sphere_dirs, tau=tau
-    )  # acc_w:[N_dirs,C], wsum:[N_dirs,1]
-
-    # --- raw(비가중) 합 / 개수 (같은 used_idx로 원시 feature 평균을 보기 위함) ---
-    C = tile_feats.shape[1]
-    Ht, Wt = int(tile['H']), int(tile['W'])
-    feat_hw = tile_feats.squeeze(0)                  # [C,Ht,Wt]
-    feat_flat = feat_hw.reshape(C, -1).permute(1,0)  # [Ht*Wt, C]
-
-    lin      = tile['lin_coords'].long()             # [M]
-    used_idx = tile['used_idx'].long()               # [M]
-    feat_sel = feat_flat.index_select(0, lin).to(torch.float32)  # [M,C]
-
-    N_dirs = acc_w.shape[0]
-    acc_raw = torch.zeros(N_dirs, C, device=feat_sel.device, dtype=torch.float32)
-    cnt_raw = torch.zeros(N_dirs, 1, device=feat_sel.device, dtype=torch.float32)
-
-    ones = torch.ones(used_idx.shape[0], 1, device=feat_sel.device, dtype=torch.float32)
-    acc_raw.index_add_(0, used_idx, feat_sel)  # 비가중 합
-    cnt_raw.index_add_(0, used_idx, ones)      # 개수
-
-    return acc_w, wsum, acc_raw, cnt_raw
-
-def build_membership_map(tiles, N_dirs):
-    # idx -> list of views that include this index
-    members = [[] for _ in range(N_dirs)]
-    for v, t in enumerate(tiles):
-        if t['used_idx'] is None or len(t['used_idx']) == 0: 
-            continue
-        for k in t['used_idx'].tolist():
-            members[k].append(v)
-    return members  # length N_dirs, each a python list of view ids
-
 ##########################################################################################################################

@@ -17,11 +17,9 @@ from diffusers import (AutoencoderKL,
 # utils : 그 외 다른 함수들 넣기
 from projection360 import (generate_fibonacci_lattice, 
                    spherical_to_perspective_tiles,
-                   fuse_perspective_to_spherical,
                    log_overlap_between_views,
                    compute_and_save_overlap_matrix,
-                   fuse_persp_to_sph_with_raw,
-                   build_membership_map
+                   fuse_perspective_to_spherical
                    )
 from projection_erp import (stitch_final_erp_from_tiles)
 
@@ -303,8 +301,7 @@ class SphereDiffusion(nn.Module):
         log_overlap_between_views(tiles, log_path=tile_info_path)
         compute_and_save_overlap_matrix(tiles, log_path=tile_csv_path, mode="count")
         
-        tau = 0.6 * math.tan(math.radians(fov_deg) * 0.5)  # distortion-aware weight
-        # feats = init_global_from_tiles_randn(tiles, C, dirs, tau, self.transformer.dtype, self.device)
+        tau = 0.6 * math.tan(math.radians(fov_deg) * 0.5)  # FoV 80 일때 0.5 정도 나옴
         if save_tile_panorama:
             save_tiles_on_panorama(tiles, pano_H=H, pano_W=W,
                                     mode="outline", step=6,
@@ -365,33 +362,81 @@ class SphereDiffusion(nn.Module):
             n_u, n_c = noise_2B.chunk(2, dim=0)
             return n_u + guidance_scale * (n_c - n_u)
 
-        # TODO : Tile 생성(결국 sampling) 이 부분이 명시적으로 해결되어야함
-        '''
-        현재 문제점(250916)
-        - Spherical latent 1개가 1개의 latent space grid로 대응되지 않는 문제 발생
-        - E.g. 1024개의 spherical latent가 sampling 되었지만, pixel 결과는 latent가 부족한 상황의 결과 발생
-        - 따라서 1개의 spherical latent가 mapping 되면, perspective latent space 상에서도 1x1-latent를 차지하는 것으로 설계 수정
-        '''
         def _gather_tile(feats_global, tile, C):
             used_idx = tile["used_idx"].long()
             lin      = tile["lin_coords"].long()
+            perm = torch.argsort(lin)
+            lin = lin[perm]; used_idx = used_idx[perm]
             Hp, Wp   = int(tile["H"]), int(tile["W"])
             flat = torch.zeros(Hp * Wp, C, device=self.device, dtype=self.transformer.dtype)
             flat.index_copy_(0, lin, feats_global[used_idx])
             return flat.view(Hp, Wp, C).permute(2, 0, 1).unsqueeze(0)
 
-        def _save_tile_preview_if_needed(tile_eps, I_bchw, step_idx, tile_idx):
-            if not save_tile_intermediate or not(step_idx % 10 == 0 or step_idx % 49 == 0):
+        # def _save_tile_preview_if_needed(tile_eps, I_bchw, step_idx, tile_idx):
+        #     if not save_tile_intermediate or not(step_idx % 10 == 0 or step_idx % 49 == 0):
+        #         return
+
+        #     tmp_sched = copy.deepcopy(self.scheduler)
+        #     t_prev = tmp_sched.timesteps[step_idx]
+        #     step_res = tmp_sched.step(model_output=tile_eps.unsqueeze(0), timestep=t_prev, sample=I_bchw)
+        #     xprev = step_res.prev_sample
+        #     if xprev.dim() == 5 and xprev.shape[1] == 1:
+        #         xprev = xprev.squeeze(1)
+        #     if xprev.dim() == 3:
+        #         xprev = xprev.unsqueeze(0)
+
+        #     sf = float(getattr(self.vae.config, "scaling_factor", 1.0))
+        #     sh = float(getattr(self.vae.config, "shift_factor", 0.0))
+
+        #     if self.rf_version == 'SANA':
+        #         autocast_enabled = True
+        #         vae_in_dtype = torch.bfloat16
+        #         lat = (xprev / 0.41407).to(torch.float32) + 0.0
+
+        #     else:  # self.rf_version == '3.5'
+        #         force_upcast = bool(getattr(self.vae.config, "force_upcast", False))
+        #         if force_upcast:
+        #             self.vae.to(dtype=torch.float32)
+        #             vae_in_dtype = torch.float32
+        #             autocast_enabled = False
+        #         else:
+        #             vae_in_dtype = getattr(self.vae, "dtype", torch.bfloat16)
+        #             autocast_enabled = (vae_in_dtype in (torch.bfloat16, torch.float16))
+
+        #         lat = (xprev.to(torch.float32) / sf) + sh
+
+        #     lat = lat.to(device=self.vae.device, dtype=vae_in_dtype)
+
+        #     if autocast_enabled and vae_in_dtype != torch.float32:
+        #         with torch.autocast(device_type='cuda', enabled=True, dtype=vae_in_dtype):
+        #             dec = self.vae.decode(lat).sample  # [-1,1]
+        #     else:
+        #         dec = self.vae.decode(lat).sample
+ 
+        #     tile_img = (dec[0].float() / 2 + 0.5).clamp(0, 1)
+        #     tile_path = os.path.join(outfolder, "tile_intermediate")
+        #     os.makedirs(tile_path, exist_ok=True)
+        #     T.ToPILImage()(tile_img.cpu()).save(os.path.join(tile_path, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
+
+        def _save_tile_preview_if_needed(tile_eps, I_bchw, step_idx, tile_idx, after_fusion: bool = False):
+            if not save_tile_intermediate or not (step_idx % 10 == 0 or step_idx % 49 == 0):
                 return
 
-            tmp_sched = copy.deepcopy(self.scheduler)
-            t_prev = tmp_sched.timesteps[step_idx]
-            step_res = tmp_sched.step(model_output=tile_eps.unsqueeze(0), timestep=t_prev, sample=I_bchw)
-            xprev = step_res.prev_sample
-            if xprev.dim() == 5 and xprev.shape[1] == 1:
-                xprev = xprev.squeeze(1)
-            if xprev.dim() == 3:
-                xprev = xprev.unsqueeze(0)
+            if after_fusion:
+                # 합성(전역 갱신) 이후의 타일 latent(I_bchw)를 그대로 디코드
+                xprev = I_bchw
+                if xprev.dim() == 3:
+                    xprev = xprev.unsqueeze(0)          # [1,C,H,W]
+            else:
+                # 기존 동작: 미리보기용으로 타일만 임시 한 스텝 진행
+                tmp_sched = copy.deepcopy(self.scheduler)
+                t_prev = tmp_sched.timesteps[step_idx]
+                step_res = tmp_sched.step(model_output=tile_eps.unsqueeze(0), timestep=t_prev, sample=I_bchw)
+                xprev = step_res.prev_sample
+                if xprev.dim() == 5 and xprev.shape[1] == 1:
+                    xprev = xprev.squeeze(1)
+                if xprev.dim() == 3:
+                    xprev = xprev.unsqueeze(0)
 
             sf = float(getattr(self.vae.config, "scaling_factor", 1.0))
             sh = float(getattr(self.vae.config, "shift_factor", 0.0))
@@ -400,7 +445,6 @@ class SphereDiffusion(nn.Module):
                 autocast_enabled = True
                 vae_in_dtype = torch.bfloat16
                 lat = (xprev / 0.41407).to(torch.float32) + 0.0
-
             else:  # self.rf_version == '3.5'
                 force_upcast = bool(getattr(self.vae.config, "force_upcast", False))
                 if force_upcast:
@@ -410,7 +454,6 @@ class SphereDiffusion(nn.Module):
                 else:
                     vae_in_dtype = getattr(self.vae, "dtype", torch.bfloat16)
                     autocast_enabled = (vae_in_dtype in (torch.bfloat16, torch.float16))
-
                 lat = (xprev.to(torch.float32) / sf) + sh
 
             lat = lat.to(device=self.vae.device, dtype=vae_in_dtype)
@@ -420,11 +463,12 @@ class SphereDiffusion(nn.Module):
                     dec = self.vae.decode(lat).sample  # [-1,1]
             else:
                 dec = self.vae.decode(lat).sample
- 
+
             tile_img = (dec[0].float() / 2 + 0.5).clamp(0, 1)
             tile_path = os.path.join(outfolder, "tile_intermediate")
             os.makedirs(tile_path, exist_ok=True)
-            T.ToPILImage()(tile_img.cpu()).save(os.path.join(tile_path, f"tile_{tile_idx:03d}_{step_idx:03d}.png"))
+            suffix = "post" if after_fusion else "pre"
+            T.ToPILImage()(tile_img.cpu()).save(os.path.join(tile_path, f"tile_{tile_idx:03d}_{step_idx:03d}_{suffix}.png"))
 
         def _decode_erp_from_feats(feats_spherical):
             erp = stitch_final_erp_from_tiles(
@@ -466,50 +510,15 @@ class SphereDiffusion(nn.Module):
             )
             return step_res.prev_sample
 
-        log_dir = os.path.join(outfolder, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        tile_count_path = os.path.join(log_dir, "tile_assigned_counts.csv")
-        membership_path = os.path.join(log_dir, "membership.json")
-        values_path     = os.path.join(log_dir, "values.csv")
-
-        N_dirs = feats.shape[0]  # [N_dirs, C]
-        membership = build_membership_map(tiles, N_dirs)
-        with open(membership_path, "w") as f:
-            json.dump({"N_dirs": N_dirs, "membership": membership}, f)
-
-        with open(values_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["step","k","view","init_raw_norm","init_weighted_norm","global_weighted_norm"])
-
-        with open(tile_count_path, "w") as f:
-            f.write("tile_idx,num_used,n_lin_coords,n_used_idx\n")
-            for t_i, tile in enumerate(tiles):
-                _, fused_w = fuse_perspective_to_spherical(
-                    tile_feats=torch.zeros(1, C, tile["H"], tile["W"], device=self.device),  # dummy
-                    tiles_info=[tile],
-                    sphere_dirs=dirs,
-                    tau=tau
-                )
-                
-                num_used = int((fused_w > 1e-12).sum().item())  # 실제 기여한 latent 개수
-                f.write(f"{t_i},{num_used},{len(tile['lin_coords'].cpu().numpy().tolist())},{len(tile['used_idx'].cpu().numpy().tolist())}\n")
-
         self.scheduler.set_timesteps(num_inference_steps)
         total_steps = len(self.scheduler.timesteps)
         print(f"[INFO] Output folder ready: {outfolder}")
         if save_intermediate:
             print(f"[INFO] Will save {len(tiles)} tiles × {num_inference_steps} steps = {len(tiles)*num_inference_steps} tile images")
-
-        with tqdm(total=total_steps, desc='Generating panorama') as pbar, \
-            open(values_path, "a", newline="") as fv:
-            wcsv = csv.writer(fv)
-
+        with tqdm(total=total_steps, desc='Generating panorama') as pbar:
             for step_idx, t_scalar in enumerate(self.scheduler.timesteps):
                 accum = torch.zeros_like(feats, dtype=torch.float32)            # [N_dirs,C]
                 wsum  = torch.zeros(feats.shape[0], 1, device=self.device, dtype=torch.float32)
-
-                init_raw_mean_per_view  = [torch.zeros_like(feats) for _ in tiles]
-                init_wavg_mean_per_view = [torch.zeros_like(feats) for _ in tiles]
 
                 for view_idx, tile in enumerate(tiles):
                     I = _gather_tile(feats, tile, C)
@@ -525,29 +534,14 @@ class SphereDiffusion(nn.Module):
                         step_idx=step_idx
                     ).squeeze(0)  # [C,H,W]
 
-                    acc_w, w_i, acc_raw, cnt_raw = fuse_persp_to_sph_with_raw(
-                        tile_prev.unsqueeze(0), tile, sphere_dirs=dirs,tau=tau
+                    acc_w, w_i = fuse_perspective_to_spherical(
+                        tile_prev.unsqueeze(0), [tile], sphere_dirs=dirs,tau=tau
                     )
                     accum += acc_w
                     wsum  += w_i
-                    raw_mean_i  = acc_raw / torch.clamp_min(cnt_raw, 1e-6)
-                    wavg_mean_i = acc_w  / torch.clamp_min(w_i,     1e-6)
-                    init_raw_mean_per_view[view_idx]  = raw_mean_i
-                    init_wavg_mean_per_view[view_idx] = wavg_mean_i
-
                     _save_tile_preview_if_needed(eps_tile, I, step_idx, view_idx)
                 feats = (accum / torch.clamp_min(wsum, 1e-6)).to(self.transformer.dtype)  # [N_dirs,C]
-                global_norm = feats.norm(dim=1)  # [N_dirs]
 
-                if step_idx % 10 == 0 or step_idx == total_steps:
-                    for k, views in enumerate(membership):
-                        if not views:
-                            continue
-                        gk = float(global_norm[k].item())
-                        for vi in views:
-                            rnorm = float(init_raw_mean_per_view[vi][k].norm().item())
-                            wnorm = float(init_wavg_mean_per_view[vi][k].norm().item())
-                            wcsv.writerow([step_idx, k, vi, rnorm, wnorm, gk])
                 _save_erp_if_needed(feats, step_idx)
                 pbar.update(1)
 

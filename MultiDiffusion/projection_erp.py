@@ -37,23 +37,23 @@ def splat_tile_to_erp(
 
     fx, fy, cx, cy = [K_px[0,0], K_px[1,1], K_px[0,2], K_px[1,2]]
     x = (u - cx) / fx
-    y = -(v - cy) / fy
-    z = torch.ones_like(x)
+    z = -(v - cy) / fy
+    y = torch.ones_like(x)
     d_cam = torch.stack([x, y, z], dim=-1)
     d_cam = torch.nn.functional.normalize(d_cam, dim=-1)
 
     R_wc = R_wc.to(torch.float32)
     d_world = torch.einsum('hwj,jk->hwk', d_cam, R_wc.T)
 
-    lon = torch.atan2(d_world[..., 0], d_world[..., 2])
-    lat = torch.asin(d_world[..., 1].clamp(-1, 1))
+    lon = torch.atan2(d_world[..., 0], d_world[..., 1])
+    lat = torch.asin(d_world[..., 2].clamp(-1, 1))
     U = (lon / (2*math.pi) + 0.5) * pano_W
     V = (0.5 - lat / math.pi) * pano_H
 
     t = math.tan(math.radians(fov_deg * 0.5))
-    r_edge = torch.maximum(torch.abs(x)/t, torch.abs(y)/t).clamp(0, 1)
+    r_edge = torch.maximum(torch.abs(x)/t, torch.abs(z)/t).clamp(0, 1)
     w_edge = torch.cos(0.5*math.pi*r_edge) ** 2
-    w_geo  = (d_cam[..., 2].clamp_min(0)) ** beta
+    w_geo  = (d_cam[..., 1].clamp_min(0)) ** beta
     w_erp  = torch.cos(lat).abs() if use_coslat else 1.0
     w = (w_edge * w_geo * w_erp).to(torch.float32).unsqueeze(0)
 
